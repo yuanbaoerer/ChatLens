@@ -20,7 +20,7 @@ def _table(session: str) -> str:
     return "Msg_" + hashlib.md5(session.encode()).hexdigest()
 
 
-def sqlite_fixture(root: Path) -> dict:
+def sqlite_fixture(root: Path, *, damaged_timestamp: bool = False) -> dict:
     for directory in ("contact", "session", "message"):
         (root / directory).mkdir(parents=True)
     with closing(sqlite3.connect(root / "contact/contact.db")) as db, db:
@@ -43,8 +43,8 @@ def sqlite_fixture(root: Path) -> dict:
         </refermsg></appmsg></msg>"""
     forward = f"""<msg><appmsg><type>19</type><title>Thread</title><recorditem>
         <recordinfo><datalist>
-          <dataitem datatype="1" dataid="note"><fromusr>{ALICE}</fromusr>
-            <datadesc>Earlier note</datadesc><srcMsgCreateTime>{STAMP - 60}</srcMsgCreateTime></dataitem>
+          <dataitem datatype="5" dataid="note"><fromusr>{ALICE}</fromusr>
+            <datadesc><![CDATA[{quote}]]></datadesc><srcMsgCreateTime>{STAMP - 60}</srcMsgCreateTime></dataitem>
           <dataitem datatype="17" dataid="nested"><datatitle>Nested</datatitle>
             <recordxml><recordinfo><datalist>
               <dataitem datatype="2" dataid="sticker"><fromusr>{BOB}</fromusr><datafmt>gif</datafmt></dataitem>
@@ -64,6 +64,8 @@ def sqlite_fixture(root: Path) -> dict:
             (3, "", 1, 1, STAMP + 4, "At the end"),
         ],
     ]
+    if damaged_timestamp:
+        shards[0].append((4, "bad-time", 1, 1, "invalid timestamp", "Unplaced message"))
     for shard, rows in enumerate(shards):
         with closing(sqlite3.connect(root / f"message/message_{shard}.db")) as db, db:
             db.execute("CREATE TABLE Name2Id (user_name TEXT)")

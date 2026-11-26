@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Iterator, Protocol, runtime_checkable
 
-from analytics.models import GroupInfo, Message, Snapshot, TimeRange
+from analytics.models import GroupInfo, Message, MessageCursor, MessagePage, Snapshot, TimeRange
 
 
 @runtime_checkable
@@ -28,4 +28,15 @@ class ChatSourceAdapter(Protocol):
         time_range: TimeRange | None = None,
     ) -> Snapshot:
         """Build an immutable, deterministic Snapshot for a single group and time range."""
+        ...
+
+    def page_messages(
+        self,
+        group_id: str,
+        time_range: TimeRange | None = None,
+        *,
+        limit: int = 100,
+        after: MessageCursor | None = None,
+    ) -> MessagePage:
+        """Page normalized messages. A changed snapshot invalidates its cursors."""
         ...

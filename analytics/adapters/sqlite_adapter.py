@@ -9,7 +9,7 @@ import hashlib
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from core.data import Archive
 from wx4 import WECHAT_TIME_ZONE
@@ -25,6 +25,8 @@ from analytics.models import (
     MediaRole,
     MediaStatus,
     Message,
+    MessageCursor,
+    MessagePage,
     Snapshot,
     TimeRange,
 )
@@ -33,6 +35,20 @@ from analytics.snapshot import MEDIA_KINDS, SnapshotBuilder, make_stable_message
 
 OFFLINE_MEDIA_REASON = "offline_sqlite_without_media_store"
 TIMEZONE_NAME = WECHAT_TIME_ZONE.tzname(None) or "Asia/Shanghai"
+# Positive Unix seconds with room for conversion to Beijing time.
+MAX_TIMESTAMP = 253402271999
+
+
+def _message_datetime(value: Any) -> datetime | None:
+    """Parse a stored create_time without letting one damaged row abort a read."""
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, WECHAT_TIME_ZONE)
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def _offline_media_refs(owner_id: str, kind: str) -> tuple[MediaRef, ...]:
@@ -137,6 +153,7 @@ class SqliteArchiveAdapter:
         parent_id: str,
         parent_sent_at: datetime,
         pseudonymizer: Pseudonymizer,
+        scope: tuple[str, str, str],
         depth: int,
         budget: list[int],
     ) -> tuple[tuple[ForwardChild, ...], bool]:
@@ -181,6 +198,7 @@ class SqliteArchiveAdapter:
                 parent_id=child_id,
                 parent_sent_at=child_sent_at,
                 pseudonymizer=pseudonymizer,
+                scope=scope,
                 depth=depth + 1,
                 budget=budget,
             )
@@ -194,6 +212,7 @@ class SqliteArchiveAdapter:
                     media_refs=_offline_media_refs(child_id, child_kind),
                     link_meta=link_meta(child_kind, child_extra),
                     forward_children=nested_children,
+                    reply_to=quote_ref(item, pseudonymizer, scope),
                     truncated=nested_truncated,
                 )
             )
@@ -260,6 +279,7 @@ class SqliteArchiveAdapter:
                 parent_id=message_id,
                 parent_sent_at=sent_at,
                 pseudonymizer=pseudonymizer,
+                scope=scope,
                 depth=0,
                 budget=[self.max_forward_children],
             )
@@ -288,27 +308,38 @@ class SqliteArchiveAdapter:
             local_evidence=locator,
         )
 
-    def iter_messages(
+    def _iter_messages(
         self,
         group_id: str,
         time_range: TimeRange | None = None,
+        *,
+        on_diagnostic: Callable[[str], None] | None = None,
     ) -> Iterator[Message]:
         archive = self._get_archive()
         if not any(row["username"] == group_id and row.get("is_group") for row in archive.sessions()):
             raise KeyError("group not found in SQLite archive")
 
-        options: dict[str, Any] = {}
+        # Bound the SQL input before heapq merges shards. SQLite can store text
+        # in an integer column and Python cannot compare it with a timestamp.
+        valid_bounds = {"start": 1, "end": MAX_TIMESTAMP}
+        options = dict(valid_bounds)
         if time_range is not None:
             if time_range.start is not None:
-                options["start"] = math.floor(time_range.start.timestamp())
+                options["start"] = max(options["start"], math.floor(time_range.start.timestamp()))
             if time_range.end is not None:
                 # core.data.time_bounds uses closed [start, end]; query coarsely
                 # and strictly enforce half-open [start, end) below.
-                options["end"] = math.ceil(time_range.end.timestamp())
+                options["end"] = min(options["end"], math.ceil(time_range.end.timestamp()))
 
         pseudonymizer = self._pseudonymizer_for(group_id)
+        invalid_timestamps = 0
+        if on_diagnostic is not None:
+            invalid_timestamps = archive.message_count(group_id, {}) - archive.message_count(group_id, valid_bounds)
         for raw in archive.messages(group_id, options=options, descending=False):
-            sent_at = datetime.fromtimestamp(raw["create_time"], WECHAT_TIME_ZONE)
+            sent_at = _message_datetime(raw.get("create_time"))
+            if sent_at is None:
+                invalid_timestamps += 1
+                continue
             if time_range is not None and not time_range.contains(sent_at):
                 continue
             yield self._normalize_message(
@@ -318,6 +349,15 @@ class SqliteArchiveAdapter:
                 sent_at=sent_at,
                 pseudonymizer=pseudonymizer,
             )
+        if invalid_timestamps and on_diagnostic is not None:
+            on_diagnostic(f"sqlite_invalid_timestamp_rows:{invalid_timestamps}")
+
+    def iter_messages(
+        self,
+        group_id: str,
+        time_range: TimeRange | None = None,
+    ) -> Iterator[Message]:
+        return self._iter_messages(group_id, time_range=time_range)
 
     def build_snapshot(
         self,
@@ -332,5 +372,24 @@ class SqliteArchiveAdapter:
             timezone_name=TIMEZONE_NAME,
         )
         builder.add_diagnostic("sqlite_offline_read_only_mode")
-        builder.add_messages(self.iter_messages(group_id, time_range=time_range))
+        builder.add_messages(
+            self._iter_messages(
+                group_id,
+                time_range=time_range,
+                on_diagnostic=builder.add_diagnostic,
+            )
+        )
         return builder.build()
+
+    def page_messages(
+        self,
+        group_id: str,
+        time_range: TimeRange | None = None,
+        *,
+        limit: int = 100,
+        after: MessageCursor | None = None,
+    ) -> MessagePage:
+        return self.build_snapshot(group_id, time_range=time_range).page_messages(
+            limit=limit,
+            after=after,
+        )

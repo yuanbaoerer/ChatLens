@@ -13,7 +13,8 @@ from PIL import Image
 from analytics.adapters import ChatSourceAdapter, JsonlExportAdapter, SqliteArchiveAdapter
 from analytics.models import MediaQuality, MediaRole, MediaStatus, TimeRange, TypeCoverage
 from analytics.privacy import Pseudonymizer, resolve_safe_path
-from fixtures import ALICE, BOB, DIRECT, GROUP, STAMP, export_fixture, sqlite_fixture, write_export
+from analytics.snapshot import SnapshotBuilder
+from tests.analytics.fixtures import ALICE, BOB, DIRECT, GROUP, STAMP, export_fixture, sqlite_fixture, write_export
 
 
 def instant(offset=0):
@@ -42,6 +43,22 @@ class OfflineTestCase(unittest.TestCase):
         for output in (repr(snapshot), json.dumps(snapshot.to_dict())):
             for sender in (ALICE, BOB):
                 self.assertNotIn(sender, output)
+
+    def assert_pages_cover_snapshot(self, adapter):
+        expected = adapter.build_snapshot(GROUP).messages
+        first = adapter.page_messages(GROUP, limit=1)
+        second = adapter.page_messages(GROUP, limit=1, after=first.next_cursor)
+        self.assertEqual(first.messages[0].sent_at, second.messages[0].sent_at)
+        seen = list(first.messages)
+        page = second
+        while True:
+            seen.extend(page.messages)
+            if page.next_cursor is None:
+                break
+            page = adapter.page_messages(GROUP, limit=2, after=page.next_cursor)
+        self.assertEqual(seen, list(expected))
+        with self.assertRaisesRegex(ValueError, "different snapshot"):
+            adapter.page_messages(GROUP, TimeRange(instant(), instant(1)), after=first.next_cursor)
 
 
 class JsonlAdapterTests(OfflineTestCase):
@@ -172,6 +189,77 @@ class JsonlAdapterTests(OfflineTestCase):
         self.assertNotEqual(left.sender_pseudonym, right.sender_pseudonym)
         self.assertNotEqual(left.message_id, right.message_id)
 
+    def test_pages_include_same_second_ties_and_reject_stale_cursors(self):
+        self.assert_pages_cover_snapshot(self.adapter)
+
+    def test_thumbnail_without_status_or_report_preserves_missing_original(self):
+        record = next(row for row in self.records if row["server_id"] == "106")
+        del record["resource_status"]
+        write_export(self.path, self.metadata, [record])
+        snapshot = self.adapter.build_snapshot(GROUP)
+        thumbnail, main = snapshot.messages[0].media_refs
+        self.assertEqual((thumbnail.status, main.status), (MediaStatus.readable, MediaStatus.missing))
+        self.assertEqual(snapshot.coverage.media_by_kind["image"], TypeCoverage(eligible=1, missing=1))
+
+    def test_animation_over_decode_budget_is_reported_as_unreadable(self):
+        with patch("analytics.adapters.jsonl_adapter.MAX_IMAGE_TOTAL_PIXELS", 200):
+            snapshot = self.adapter.build_snapshot(GROUP)
+        animation = next(msg for msg in snapshot.messages if msg.kind == "emoji")
+        ref, = animation.media_refs
+        self.assertEqual((ref.status, ref.reason), (MediaStatus.failed, "too_many_pixels"))
+        self.assertIsNone(ref.content_hash)
+        self.assertEqual(snapshot.coverage.media_by_kind["emoji"].failed, 1)
+
+    def test_unreadable_optional_report_keeps_inline_media(self):
+        original_open = Path.open
+
+        def open_path(path, *args, **kwargs):
+            if path.name == "resource-report.jsonl":
+                raise PermissionError("synthetic locked report")
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", open_path):
+            snapshot = self.adapter.build_snapshot(GROUP)
+        self.assertIn("resource_report_read_error", snapshot.diagnostics)
+        self.assertEqual(snapshot.coverage.media_by_kind["image"].readable, 1)
+
+    def test_reimport_resolved_media_keeps_one_message_and_its_identity(self):
+        window = TimeRange(instant(5), instant(6))
+        missing, = self.adapter.iter_messages(GROUP, window)
+        asset = self.path.parent / "synthetic_assets/resources/missing.png"
+        with Image.new("RGB", (2, 2)) as image:
+            image.save(asset)
+        readable, = self.adapter.iter_messages(GROUP, window)
+        for copies in ((missing, readable), (readable, missing)):
+            builder = SnapshotBuilder(source_id=missing.source_id, account_scope=missing.account_scope, group_id=GROUP)
+            builder.add_messages(copies)
+            snapshot = builder.build()
+            only, = snapshot.messages
+            self.assertEqual(only.message_id, missing.message_id)
+            self.assertEqual(snapshot.coverage.media_by_kind["image"], TypeCoverage(eligible=1, readable=1))
+
+    def test_ambiguous_quote_targets_are_cleared_at_all_depths(self):
+        original, duplicate = self.records[:2]
+        duplicate["text"] = "Other message with same server ID"
+        parent = next(row for row in self.records if row["kind"] == "chatrecord")
+        child = parent["forward"]["messages"][0]
+        child.update(kind="quote", quote=original)
+        write_export(self.path, self.metadata, self.records)
+        snapshot = self.adapter.build_snapshot(GROUP)
+        reply = next(msg for msg in snapshot.messages if msg.kind == "quote")
+        forwarded = next(msg for msg in snapshot.messages if msg.kind == "chatrecord").forward_children[0]
+        for item in (reply, forwarded):
+            self.assertIsNone(item.reply_to.target_message_id)
+            self.assertEqual(item.reply_to.text_excerpt, "Hello")
+
+    def test_date_coverage_is_observed_per_kind(self):
+        coverage = self.adapter.build_snapshot(GROUP).coverage
+        self.assertEqual(coverage.dates_by_kind["text"].latest_at, instant(12))
+        emoji = coverage.media_dates_by_kind["emoji"]
+        self.assertEqual((emoji.earliest_at, emoji.latest_at), (instant(1), instant(1)))
+        self.assertEqual(coverage.media_dates_by_kind["image"].latest_at, instant(11))
+        self.assertNotIn("chatrecord", coverage.media_dates_by_kind)
+
 
 class SqliteAdapterTests(OfflineTestCase):
     def test_shards_quotes_nested_forward_and_read_only(self):
@@ -201,6 +289,8 @@ class SqliteAdapterTests(OfflineTestCase):
             note, nested = parent.forward_children
             self.assertEqual(note.sent_at, instant(-60))
             self.assertEqual(note.sender_pseudonym, ties[0].sender_pseudonym)
+            self.assertEqual(note.reply_to.target_message_id, ties[0].message_id)
+            self.assertEqual(note.reply_to.text_excerpt, "Compressed hello")
             sticker, = nested.forward_children
             self.assertEqual(sticker.kind, "emoji")
             image, = first.messages[-2].media_refs
@@ -210,6 +300,18 @@ class SqliteAdapterTests(OfflineTestCase):
                 self.assertIsNone(ref.content_hash)
             self.assert_no_sender_ids(first)
         self.assertEqual(before, source_files(root))
+
+    def test_damaged_timestamp_is_skipped_and_diagnosed(self):
+        library = sqlite_fixture(self.root / "db", damaged_timestamp=True)
+        with SqliteArchiveAdapter(library) as adapter:
+            snapshot = adapter.build_snapshot(GROUP)
+            self.assertEqual(snapshot.coverage.total_top_level, 6)
+            self.assertIn("sqlite_invalid_timestamp_rows:1", snapshot.diagnostics)
+            self.assertNotIn("Unplaced message", repr(snapshot))
+
+    def test_pages_include_cross_shard_ties(self):
+        with SqliteArchiveAdapter(sqlite_fixture(self.root / "db")) as adapter:
+            self.assert_pages_cover_snapshot(adapter)
 
 
 class PrivacyAndTimeTests(OfflineTestCase):

@@ -10,9 +10,12 @@ from typing import Any, Iterable
 from analytics.models import (
     CoverageSummary,
     ForwardChild,
+    MediaQuality,
     MediaRole,
     MediaStatus,
     Message,
+    ObservedSpan,
+    QuoteRef,
     Snapshot,
     TimeRange,
     TypeCoverage,
@@ -61,15 +64,39 @@ def make_stable_message_id(
 
 
 def _message_content_fingerprint(msg: Message) -> str:
-    """Canonical SHA-256 of normalized message content (excluding message_id/locator)."""
-    payload = msg.to_dict()
-    del payload["message_id"], payload["local_evidence"]
-    return _digest(payload)
+    """Fingerprint message and forward content independently of media resolution."""
+    def content(node: Message | ForwardChild) -> tuple:
+        return (
+            node.sender_pseudonym,
+            node.sent_at.astimezone(timezone.utc).isoformat() if node.sent_at is not None else None,
+            node.kind,
+            node.text,
+            node.link_meta.to_dict() if node.link_meta is not None else None,
+            node.reply_to.to_dict() if node.reply_to is not None else None,
+            node.forward_truncated if isinstance(node, Message) else node.truncated,
+            tuple(content(child) for child in node.forward_children),
+        )
+
+    return _digest(content(msg))
 
 
-def _evidence_key(message: Message) -> str:
-    locator = message.local_evidence
-    return canonical_json(locator.to_dict()) if locator is not None else "null"
+def _preferred_copy_key(message: Message) -> tuple[int, int, int, str]:
+    """Prefer resolved originals, then readable previews and explicit failure evidence."""
+    primary = readable = diagnosed = 0
+
+    def visit(node: Message | ForwardChild) -> None:
+        nonlocal primary, readable, diagnosed
+        for ref in node.media_refs:
+            if ref.status == MediaStatus.readable:
+                readable += 1
+                primary += ref.role == MediaRole.main and ref.quality != MediaQuality.thumbnail
+            elif ref.status in (MediaStatus.failed, MediaStatus.unsupported):
+                diagnosed += 1
+        for child in node.forward_children:
+            visit(child)
+
+    visit(message)
+    return (-primary, -readable, -diagnosed, canonical_json(message.to_dict()))
 
 
 def _with_message_id(message: Message, message_id: str) -> Message:
@@ -99,6 +126,26 @@ def _with_message_id(message: Message, message_id: str) -> Message:
     )
 
 
+def _clear_ambiguous_quotes(message: Message, ambiguous_ids: set[str]) -> Message:
+    def unresolved(quote: QuoteRef | None) -> QuoteRef | None:
+        if quote is not None and quote.target_message_id in ambiguous_ids:
+            return replace(quote, target_message_id=None)
+        return quote
+
+    def forward(child: ForwardChild) -> ForwardChild:
+        reply = unresolved(child.reply_to)
+        children = tuple(forward(nested) for nested in child.forward_children)
+        if reply is child.reply_to and all(left is right for left, right in zip(children, child.forward_children)):
+            return child
+        return replace(child, reply_to=reply, forward_children=children)
+
+    reply = unresolved(message.reply_to)
+    children = tuple(forward(child) for child in message.forward_children)
+    if reply is message.reply_to and all(left is right for left, right in zip(children, message.forward_children)):
+        return message
+    return replace(message, reply_to=reply, forward_children=children)
+
+
 def _count_forward_children(children: tuple[ForwardChild, ...]) -> int:
     total = 0
     for child in children:
@@ -107,8 +154,8 @@ def _count_forward_children(children: tuple[ForwardChild, ...]) -> int:
 
 
 def _primary_media_status(msg: Message) -> MediaStatus:
-    main_refs = [ref for ref in msg.media_refs if ref.role == MediaRole.main]
-    candidates = main_refs if main_refs else list(msg.media_refs)
+    candidates = [ref for ref in msg.media_refs if ref.role == MediaRole.main
+                  and ref.quality != MediaQuality.thumbnail]
     if not candidates:
         return MediaStatus.missing
     if any(ref.status == MediaStatus.readable for ref in candidates):
@@ -120,15 +167,23 @@ def _compute_coverage(messages: tuple[Message, ...], timezone_name: str) -> Cove
     by_kind_counts: dict[str, int] = {}
     media_buckets: dict[str, dict[str, int]] = {}
     forward_child_count = 0
+    dates_by_kind: dict[str, ObservedSpan] = {}
+    media_dates_by_kind: dict[str, ObservedSpan] = {}
+
+    def observe(spans: dict[str, ObservedSpan], msg: Message) -> None:
+        previous = spans.get(msg.kind)
+        spans[msg.kind] = ObservedSpan(previous.earliest_at if previous else msg.sent_at, msg.sent_at)
 
     for msg in messages:
         by_kind_counts[msg.kind] = by_kind_counts.get(msg.kind, 0) + 1
+        observe(dates_by_kind, msg)
         forward_child_count += _count_forward_children(msg.forward_children)
 
         is_media_message = msg.kind in MEDIA_KINDS or any(
             ref.role == MediaRole.main for ref in msg.media_refs
         )
         if is_media_message:
+            observe(media_dates_by_kind, msg)
             bucket = media_buckets.setdefault(
                 msg.kind,
                 {
@@ -157,6 +212,8 @@ def _compute_coverage(messages: tuple[Message, ...], timezone_name: str) -> Cove
         timezone=timezone_name,
         by_kind=by_kind,
         media_by_kind=media_by_kind,
+        dates_by_kind=dates_by_kind,
+        media_dates_by_kind=media_dates_by_kind,
     )
 
 
@@ -213,7 +270,7 @@ class SnapshotBuilder:
         fingerprint = _message_content_fingerprint(message)
         variants = self._buckets.setdefault(base_id, {})
         previous = variants.get(fingerprint)
-        if previous is None or _evidence_key(message) < _evidence_key(previous):
+        if previous is None or _preferred_copy_key(message) < _preferred_copy_key(previous):
             variants[fingerprint] = message
         return True
 
@@ -225,6 +282,7 @@ class SnapshotBuilder:
         resolved: list[Message] = []
         used_ids = set(self._buckets)
         diagnostics = list(self._diagnostics)
+        ambiguous_ids = {base_id for base_id, variants in self._buckets.items() if len(variants) > 1}
 
         for base_id in sorted(self._buckets):
             variants = self._buckets[base_id]
@@ -240,6 +298,9 @@ class SnapshotBuilder:
                     final_id = self._unique_collision_id(base_id, fingerprint, used_ids)
                     used_ids.add(final_id)
                 resolved.append(_with_message_id(message, final_id))
+
+        if ambiguous_ids:
+            resolved = [_clear_ambiguous_quotes(message, ambiguous_ids) for message in resolved]
 
         resolved.sort(key=lambda msg: (msg.sent_at.astimezone(timezone.utc), msg.message_id))
         frozen_messages = tuple(resolved)

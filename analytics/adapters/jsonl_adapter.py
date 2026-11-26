@@ -21,6 +21,8 @@ from analytics.models import (
     MediaRole,
     MediaStatus,
     Message,
+    MessageCursor,
+    MessagePage,
     Snapshot,
     TimeRange,
 )
@@ -30,6 +32,12 @@ from analytics.snapshot import MEDIA_KINDS, SnapshotBuilder, make_stable_message
 DEFAULT_TIMEZONE_NAME = "Asia/Shanghai"
 DEFAULT_WECHAT_TZ = timezone(timedelta(hours=8), DEFAULT_TIMEZONE_NAME)
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"})
+# Only raster plugins shipped with Pillow are permitted; anything else would require
+# an external decoder (for example EPS/PostScript) and must never run during an import.
+SUPPORTED_IMAGE_FORMATS = frozenset({"BMP", "GIF", "JPEG", "PNG", "TIFF", "WEBP"})
+MAX_MEDIA_FILE_BYTES = 256 * 1024 * 1024
+MAX_IMAGE_FRAMES = 1000
+MAX_IMAGE_TOTAL_PIXELS = 64_000_000
 _RESOURCE_STATES = {
     "available": MediaStatus.readable,
     "missing": MediaStatus.missing,
@@ -220,38 +228,48 @@ class JsonlExportAdapter:
         if safe_report is None:
             diagnostics.append("resource_report_path_outside_root")
             return by_server_id, diagnostics
-        if not safe_report.is_file():
+        try:
+            if not safe_report.is_file():
+                return by_server_id, diagnostics
+            handle = safe_report.open("r", encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            # The report is optional enrichment: a permissions/encoding/IO failure must
+            # not abort the export read, and the diagnostic must not leak local paths.
+            diagnostics.append("resource_report_read_error")
             return by_server_id, diagnostics
 
         entry_count = 0
         status_counts: dict[str, int] = {}
         reason_counts: dict[str, int] = {}
-        with safe_report.open("r", encoding="utf-8-sig") as handle:
-            for line_no, raw_line in enumerate(handle, start=1):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    diagnostics.append(f"resource_report_malformed:line={line_no}")
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                entry_count += 1
-                msg_id = str(entry.get("message_id") or "").strip()
-                status = str(entry.get("status") or "").strip().lower()
-                status = status if status in _RESOURCE_STATES else "unknown"
-                status_counts[status] = status_counts.get(status, 0) + 1
-                reason = self._extract_report_reason(entry)
-                if reason:
-                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
-                if msg_id not in ("", "0") and msg_id not in ambiguous_ids:
-                    fields = {"status": status, "reason": reason, "kind": entry.get("kind")}
-                    previous = by_server_id.setdefault(msg_id, fields)
-                    if previous != fields:
-                        ambiguous_ids.add(msg_id)
-                        del by_server_id[msg_id]
+        try:
+            with handle:
+                for line_no, raw_line in enumerate(handle, start=1):
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        diagnostics.append(f"resource_report_malformed:line={line_no}")
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_count += 1
+                    msg_id = str(entry.get("message_id") or "").strip()
+                    status = str(entry.get("status") or "").strip().lower()
+                    status = status if status in _RESOURCE_STATES else "unknown"
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    reason = self._extract_report_reason(entry)
+                    if reason:
+                        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                    if msg_id not in ("", "0") and msg_id not in ambiguous_ids:
+                        fields = {"status": status, "reason": reason, "kind": entry.get("kind")}
+                        previous = by_server_id.setdefault(msg_id, fields)
+                        if previous != fields:
+                            ambiguous_ids.add(msg_id)
+                            del by_server_id[msg_id]
+        except (OSError, UnicodeError):
+            diagnostics.append("resource_report_read_error")
 
         diagnostics.append(f"resource_report:entries={entry_count}")
         for status in sorted(status_counts):
@@ -355,7 +373,7 @@ class JsonlExportAdapter:
                 reason=reason,
             )
 
-        if safe_path is None or not safe_path.is_file():
+        if safe_path is None:
             return MediaRef(
                 media_id=media_id,
                 kind=ref_kind,
@@ -364,6 +382,38 @@ class JsonlExportAdapter:
                 quality=quality,
                 status=MediaStatus.missing,
                 reason="file_not_found",
+            )
+        try:
+            if not safe_path.is_file():
+                return MediaRef(
+                    media_id=media_id,
+                    kind=ref_kind,
+                    relative_path=normalized_rel,
+                    role=role,
+                    quality=quality,
+                    status=MediaStatus.missing,
+                    reason="file_not_found",
+                )
+            file_size = safe_path.stat().st_size
+        except OSError:
+            return MediaRef(
+                media_id=media_id,
+                kind=ref_kind,
+                relative_path=normalized_rel,
+                role=role,
+                quality=quality,
+                status=MediaStatus.failed,
+                reason="read_error",
+            )
+        if file_size > MAX_MEDIA_FILE_BYTES:
+            return MediaRef(
+                media_id=media_id,
+                kind=ref_kind,
+                relative_path=normalized_rel,
+                role=role,
+                quality=quality,
+                status=MediaStatus.failed,
+                reason="file_too_large",
             )
 
         try:
@@ -384,21 +434,73 @@ class JsonlExportAdapter:
             or safe_path.suffix.lower() in IMAGE_EXTENSIONS
         )
         if should_inspect_image:
-            try:
-                with Image.open(safe_path) as img:
-                    dimensions = (int(img.width), int(img.height))
-                    frame_count = max(1, int(getattr(img, "n_frames", 1)))
-                    for frame in range(frame_count):
-                        img.seek(frame)
-                        img.load()
-                    is_animated = frame_count > 1
-                    mime = img.get_format_mimetype()
-            except (OSError, SyntaxError, ValueError, EOFError, Image.DecompressionBombError):
+            if safe_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                # Refuse formats whose Pillow plugin may shell out to an external decoder.
                 return MediaRef(
                     media_id=media_id,
                     kind=ref_kind,
                     relative_path=normalized_rel,
                     content_hash=content_hash,
+                    role=role,
+                    quality=quality,
+                    status=MediaStatus.failed,
+                    reason="unsupported_image_format",
+                )
+            try:
+                with Image.open(safe_path, formats=tuple(sorted(SUPPORTED_IMAGE_FORMATS))) as img:
+                    image_format = str(img.format or "").upper()
+                    if image_format not in SUPPORTED_IMAGE_FORMATS:
+                        return MediaRef(
+                            media_id=media_id,
+                            kind=ref_kind,
+                            relative_path=normalized_rel,
+                            content_hash=content_hash,
+                            role=role,
+                            quality=quality,
+                            status=MediaStatus.failed,
+                            reason="unsupported_image_format",
+                        )
+                    dimensions = img.size
+                    frame_count = 0
+                    pixels = 0
+                    for frame in range(MAX_IMAGE_FRAMES + 1):
+                        try:
+                            img.seek(frame)
+                        except EOFError:
+                            if not frame_count:
+                                raise
+                            break
+                        pixels += img.width * img.height
+                        if frame == MAX_IMAGE_FRAMES or pixels > MAX_IMAGE_TOTAL_PIXELS:
+                            return MediaRef(
+                                media_id=media_id,
+                                kind=ref_kind,
+                                relative_path=normalized_rel,
+                                role=role,
+                                quality=quality,
+                                status=MediaStatus.failed,
+                                reason="too_many_frames" if frame == MAX_IMAGE_FRAMES else "too_many_pixels",
+                            )
+                        img.load()
+                        frame_count += 1
+                    is_animated = frame_count > 1
+                    mime = img.get_format_mimetype()
+            except Image.DecompressionBombError:
+                return MediaRef(
+                    media_id=media_id,
+                    kind=ref_kind,
+                    relative_path=normalized_rel,
+                    content_hash=content_hash,
+                    role=role,
+                    quality=quality,
+                    status=MediaStatus.failed,
+                    reason="too_many_pixels",
+                )
+            except (OSError, SyntaxError, ValueError, EOFError, MemoryError):
+                return MediaRef(
+                    media_id=media_id,
+                    kind=ref_kind,
+                    relative_path=normalized_rel,
                     role=role,
                     quality=quality,
                     status=MediaStatus.failed,
@@ -461,39 +563,24 @@ class JsonlExportAdapter:
                     )
                 )
 
-        if kind in MEDIA_KINDS:
-            has_main = any(ref.role == MediaRole.main for ref in refs)
-            raw_resource_status = str(raw.get("resource_status") or "").strip().lower()
-            if not raw_resource_status and report_status in _RESOURCE_STATES:
-                raw_resource_status = report_status
-
-            if not has_main and raw_resource_status not in ("", "available"):
-                mapped_status, reason = _map_non_available_status(
-                    raw_resource_status,
-                    report_reason if raw_resource_status == report_status else None,
+        if kind in MEDIA_KINDS and not any(ref.role == MediaRole.main for ref in refs):
+            raw_status = str(raw.get("resource_status") or "").strip().lower()
+            if not raw_status and report_status in _RESOURCE_STATES:
+                raw_status = report_status
+            if raw_status in ("", "available"):
+                status = MediaStatus.missing
+                reason = "no_main_resource" if refs else "no_resource_attached"
+            else:
+                status, reason = _map_non_available_status(
+                    raw_status, report_reason if raw_status == report_status else None,
                 )
-                refs.append(
-                    MediaRef(
-                        media_id=f"{owner_id}:main",
-                        kind=kind,
-                        relative_path=None,
-                        role=MediaRole.main,
-                        status=mapped_status,
-                        reason=reason,
-                    )
-                )
-            elif not refs:
-                refs.append(
-                    MediaRef(
-                        media_id=f"{owner_id}:m0",
-                        kind=kind,
-                        relative_path=None,
-                        role=MediaRole.main,
-                        quality=MediaQuality.unknown,
-                        status=MediaStatus.missing,
-                        reason=report_reason or "no_resource_attached",
-                    )
-                )
+            refs.append(MediaRef(
+                media_id=f"{owner_id}:main",
+                kind=kind,
+                role=MediaRole.main,
+                status=status,
+                reason=reason,
+            ))
 
         return tuple(refs)
 
@@ -506,6 +593,7 @@ class JsonlExportAdapter:
         tz: tzinfo,
         pseudonymizer: Pseudonymizer,
         report_by_id: dict[str, dict[str, Any]],
+        scope: tuple[str, str, str],
         depth: int,
         budget: list[int],
     ) -> tuple[tuple[ForwardChild, ...], bool]:
@@ -553,6 +641,7 @@ class JsonlExportAdapter:
                 tz=tz,
                 pseudonymizer=pseudonymizer,
                 report_by_id=report_by_id,
+                scope=scope,
                 depth=depth + 1,
                 budget=budget,
             )
@@ -567,6 +656,7 @@ class JsonlExportAdapter:
                     link_meta=child_link,
                     forward_children=nested_children,
                     truncated=nested_truncated,
+                    reply_to=quote_ref(item, pseudonymizer, scope),
                 )
             )
             truncated = truncated or nested_truncated
@@ -631,6 +721,7 @@ class JsonlExportAdapter:
             tz=tz,
             pseudonymizer=pseudonymizer,
             report_by_id=report_by_id,
+            scope=scope,
             depth=0,
             budget=[self.max_forward_children],
         )
@@ -717,3 +808,13 @@ class JsonlExportAdapter:
         builder.add_messages(self._iter_records(records, group_id, time_range, tz, pseudonymizer, report_by_id))
 
         return builder.build()
+
+    def page_messages(
+        self,
+        group_id: str,
+        time_range: TimeRange | None = None,
+        *,
+        limit: int = 100,
+        after: MessageCursor | None = None,
+    ) -> MessagePage:
+        return self.build_snapshot(group_id, time_range).page_messages(limit=limit, after=after)
