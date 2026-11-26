@@ -432,6 +432,6 @@ python scripts/package_release.py .\release --no-source
 | 文本/链接/引用/转发覆盖 | 文本、分享链接(`kind=link`)、引用(`kind=quote`)、合并转发(`kind=chatrecord`) 均正确解析且嵌套转发子项数与微信内一致 | **BLOCKED（待 Windows 实测）** |
 | 图片覆盖率 | 统计 `kind=image` 的 `available (original)` / `available (thumbnail)` / `encrypted` / `missing` / `unsupported` 实际占比；确认执行 `recover_images` 前后变化 | **BLOCKED（待 Windows 实测）** |
 | GIF 与表情包覆盖率 | 统计 `kind=emoji` 在关闭远端下载下的本地命中率（`available` vs `missing`/`encrypted`），验证动态 GIF 是否保持多帧而非退化为静态图 | **BLOCKED（待 Windows 实测）** |
-| 离线导出产物复用性 | 将该授权 JSONL + `*_assets/` 目录复制到本机临时路径（仅本机、不入库），确认 CL-01 的 `JsonlExportAdapter` 可完整读取 | **BLOCKED（待 CL-01 + Windows 样本）** |
+| 离线导出产物复用性 | 将授权 JSONL 和对应 `*_assets/` 目录放在本机仓库外，用已合并的 `JsonlExportAdapter` 验证消息导入与相对媒体路径解析，并只记录非敏感覆盖统计 | **BLOCKED（待 Windows 授权样本实测）** |
 
 > 完整 WSL + Windows 混合开发环境配置、依赖隔离规范与日常命令见 [docs/chatlens/dev-environment.md](dev-environment.md)。

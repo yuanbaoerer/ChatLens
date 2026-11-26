@@ -2,6 +2,16 @@
 
 Each task uses focused PR, tests, evidence, no auto-merge. Dependencies are logical task IDs, not assumed GitHub issue numbers.
 
+## Implementation status
+
+| ID | Repository status | Verification |
+|---|---|---|
+| CL-00 | Audit and hybrid development guide merged in [PR #2](https://github.com/yuanbaoerer/ChatLens/pull/2) (`720af50`). | WSL audit and synthetic read checks completed. Windows native build, WebView2 demo, WeChat integration and authorized media coverage remain pending. See the [Windows acceptance checklist](phase0-audit.md#72-无法在-wsl-完成的验证status-blocked--需在-windows-原生环境执行). |
+| CL-01 | Adapter and immutable snapshot merged in [PR #3](https://github.com/yuanbaoerer/ChatLens/pull/3) (`a3fd26e`). | 19 Analytics tests and 8 Moect baseline tests passed in WSL with Python 3.11 before merge. Import of an authorized Windows export remains pending. |
+| CL-02 | Next implementation task. | Planned scope is the typed analyzer registry, local execution with progress and cancellation, and SQLite run persistence. |
+
+## Task roadmap
+
 | ID | Priority | Task | Dependency | Acceptance |
 |---|---|---|---|---|
 | CL-00 | P0 | Audit and reproduce Moect baseline | — | actual file/line seam map, baseline build/demo evidence, authorized media coverage; missing capabilities documented |
@@ -26,5 +36,5 @@ Each task uses focused PR, tests, evidence, no auto-merge. Dependencies are logi
 
 Sequence: CL-00 first alone, then adapter/lifecycle; deterministic report vertical slice and GUI shell; ordinary LLM; Jev/embedding; full report and evaluation. Privacy starts with first data handling. No broad infrastructure or unsupported live monitoring. A partial deterministic product is not the full MVP; release after complete P0 with honest coverage.
 
-## Coding agent first task
+## Original CL-00 task brief
 Read AGENTS.md and docs/chatlens. Work only on CL-00. On Windows reproduce upstream documented Python 3.11, npm frontend build and demo/installer where feasible. Trace actual read-only service/export/media/bridge/task seams with file+line pointers and data examples (synthetic only in repo); record version, baseline commit, command outputs, missing media and build limitations. Validate authorized sample locally without uploading or publishing it; if environment lacks Windows/WeChat, document exact user-run checks and mark blocked. Propose minimal adapter and GUI integration seams and tests. Add audit report docs/chatlens/phase0-audit.md, no functional change, no credentials, no security bypass, no automatic merge. Open PR to this fork; stop after CL-00.
