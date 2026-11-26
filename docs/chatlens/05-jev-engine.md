@@ -1,0 +1,7 @@
+# Jev decision provider
+
+Use typed DecisionProvider interface: capability discovery, evaluate(candidate, atomic questions, timeout) -> validated probabilities/scores, diagnostics, model version. Verify actual TypeSafe Jev API contract/model availability/auth/limits from official docs during implementation; do not assume OpenAI-compatible chat endpoint or raw schema. Vision support is optional and must be validated; P0 image detection works without it.
+
+Atomic questions: same event? equivalent informational claims? does newer add material claim? contradiction? (optional) same meme template? Independently evaluate as supported; compose with explicit deterministic policy. Example starting thresholds: duplicate score >=0.90 AND no new/conflicting claim above calibrated veto, 0.60–0.90 uncertain; actual thresholds selected using labeled Chinese data, scores not assumed calibrated. Contradiction or update blocks duplicate auto-merge. Unsupported/malformed responses or timeouts => UNCERTAIN, not unrelated. Store evidence IDs and question/config versions, model scores; no fabricated explanations.
+
+Bound concurrency, retries on transient failures with backoff, timeout, call/budget cap, cancel and opt-in, redact minimal snippets before network. Local rule-only mode, mock provider for CI and LLM-judge comparison. GUI shows model enabled/disabled/error, actual usage and partial results. Do not transmit raw IDs, credentials, full history or images by default. Verify provider compatibility and real endpoint using authorized test data only.

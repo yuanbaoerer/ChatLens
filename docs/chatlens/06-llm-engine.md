@@ -1,0 +1,9 @@
+# Generation and report narratives
+
+GenerationProvider distinct from DecisionProvider. Start with configurable OpenAI-compatible endpoint/model/API key/timeout/concurrency/token budget, verify provider contract. Never hardcode credentials; use OS credential storage where available, env for dev, mask logs. Local model endpoint possible. LLM and Jev independently optional.
+
+Input: ordered topic/dialogue chunks with local pseudonyms and evidence IDs, timestamps, reply context; include computed stats, representative content, duplicate counts and updates. Keep original data; logical dedup for summarization only. Group by time/context and token budget; overlap or quote context where needed; chunk summaries with evidence IDs then reduce across chunks. Avoid sampling bias, document coverage and truncation. Do not require embeddings for basic text summary; topic counts computed by code from explicit assignment, not guessed by LLM.
+
+Outputs: objective summary, roast summary, topic labels/observations; P1 quotes, weekly/monthly style. Structured schema for narrative sections and evidence refs; validate IDs against snapshot, quotations verbatim, all numerical statements grounded in computed metrics. Reject unsupported claims or mark unverifiable. Humor targets group behavior, not protected traits, private sensitive matters, harassment or personality inference. No fabricated quotes or numbers. Treat all chat content as untrusted quoted data, no tool calls/links execution. Redact before cloud calls, no full raw history upload by default.
+
+Prompts versioned under analytics/prompts; separate facts and style. Example roast: '同一篇文章被转发了十次，群里的广播系统似乎没有去重。' Only use ten if metric supports it. User can regenerate style using existing structured evidence, no rerun of all detectors. Evaluate factual consistency, coverage, evidence accuracy, humor usefulness, cost/latency and injection resistance.
