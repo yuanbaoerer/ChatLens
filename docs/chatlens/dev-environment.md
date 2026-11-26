@@ -78,13 +78,15 @@ uv pip install Pillow==12.0.0 zstandard==0.25.0 pycryptodomex==3.24.1 psutil==7.
 # 3. 验证跨平台数据读取层导入正常（不触发 wx4/media.py Win32 阻塞）
 .venv-wsl/bin/python -c "import core.data, wx4.reader, wx4.forward; print('OK')"
 
-# 4. （CL-01 起）运行 Analytics Core 全量跨平台测试（离线、无微信）
-# .venv-wsl/bin/python -m unittest discover -s tests/analytics -p "test_*.py" -v
+# 4. 运行 Analytics Core 跨平台测试（离线、无微信）
+.venv-wsl/bin/python -m unittest discover -s tests/analytics -p "test_*.py" -v
 
 # 5. 提交前差异与格式检查
 git diff --check
 git status -sb
 ```
+
+分析适配器的 `page_messages` 按时间和消息 ID 分页。从同一来源和时间范围重建快照时，内容变动会使旧游标失效。需要连续浏览多页时，可先调用 `build_snapshot`，再在返回的快照上调用 `Snapshot.page_messages`，避免重复读取源文件和检查媒体。
 
 ### 4.2 Windows 原生侧常用命令（PowerShell）
 
