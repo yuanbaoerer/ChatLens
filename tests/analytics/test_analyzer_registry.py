@@ -59,10 +59,10 @@ class AnalyzerRegistryTests(unittest.TestCase):
             AnalyzerRegistry([SyntheticAnalyzer("stage", prerequisites=("same", "same"))])
         self.assertEqual(caught.exception.code, "duplicate_prerequisite")
 
-    def test_production_registry_is_empty_until_analyzers_are_implemented(self):
+    def test_production_registry_contains_the_media_duplicate_analyzer(self):
         registry = default_registry()
-        self.assertEqual(registry.plan(), ())
-        self.assertEqual(tuple(registry), ())
+        self.assertEqual([analyzer.analyzer_id for analyzer in registry], ["media.duplicates"])
+        self.assertEqual(registry.plan()[0].version, "1")
 
 
 if __name__ == "__main__":

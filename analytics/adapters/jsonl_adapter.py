@@ -12,6 +12,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from PIL import Image
 
 from analytics.adapters._moect import link_meta, quote_ref
+from analytics.media_limits import (
+    IMAGE_EXTENSIONS,
+    MAX_IMAGE_FRAMES,
+    MAX_IMAGE_TOTAL_PIXELS,
+    MAX_MEDIA_FILE_BYTES,
+    SUPPORTED_IMAGE_FORMATS,
+)
 from analytics.models import (
     ForwardChild,
     GroupInfo,
@@ -31,13 +38,6 @@ from analytics.snapshot import MEDIA_KINDS, SnapshotBuilder, make_stable_message
 
 DEFAULT_TIMEZONE_NAME = "Asia/Shanghai"
 DEFAULT_WECHAT_TZ = timezone(timedelta(hours=8), DEFAULT_TIMEZONE_NAME)
-IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"})
-# Only raster plugins shipped with Pillow are permitted; anything else would require
-# an external decoder (for example EPS/PostScript) and must never run during an import.
-SUPPORTED_IMAGE_FORMATS = frozenset({"BMP", "GIF", "JPEG", "PNG", "TIFF", "WEBP"})
-MAX_MEDIA_FILE_BYTES = 256 * 1024 * 1024
-MAX_IMAGE_FRAMES = 1000
-MAX_IMAGE_TOTAL_PIXELS = 64_000_000
 _RESOURCE_STATES = {
     "available": MediaStatus.readable,
     "missing": MediaStatus.missing,
