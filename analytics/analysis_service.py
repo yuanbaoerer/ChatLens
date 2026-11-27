@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import uuid
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,49 @@ class _Request:
     plan: tuple[Analyzer, ...]
     stages: tuple[StageSpec, ...]
     cancellation: Cancellation
+
+
+class _BoundedJobQueue:
+    """Bounded FIFO that can drop a cancelled run without waiting for the worker."""
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._items: deque[_Request] = deque()
+        self._condition = threading.Condition()
+
+    def put_nowait(self, request: _Request) -> None:
+        with self._condition:
+            if len(self._items) >= self._capacity:
+                raise queue.Full
+            self._items.append(request)
+            self._condition.notify()
+
+    def get(self, timeout: float | None = None) -> _Request:
+        with self._condition:
+            if not self._items:
+                if not self._condition.wait(timeout):
+                    raise queue.Empty
+            if not self._items:
+                raise queue.Empty
+            return self._items.popleft()
+
+    def full(self) -> bool:
+        with self._condition:
+            return len(self._items) >= self._capacity
+
+    def remove(self, run_id: str) -> bool:
+        with self._condition:
+            for index, request in enumerate(self._items):
+                if request.run_id == run_id:
+                    del self._items[index]
+                    self._condition.notify_all()
+                    return True
+            return False
+
+    def clear(self) -> None:
+        with self._condition:
+            self._items.clear()
+            self._condition.notify_all()
 
 
 def _snapshot_evidence_ids(snapshot: Snapshot) -> set[str]:
@@ -104,7 +148,7 @@ class AnalysisService:
         self.queue_capacity = queue_capacity
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-        self._queue: queue.Queue[_Request] = queue.Queue(maxsize=queue_capacity)
+        self._queue = _BoundedJobQueue(queue_capacity)
         self._admission_lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._stop = threading.Event()
@@ -133,7 +177,6 @@ class AnalysisService:
         if context is not None and not isinstance(context, AnalysisContext):
             raise TypeError("context must be an AnalysisContext or None")
         plan = self.registry.plan()
-        context = replace(context or AnalysisContext(), workspace=self.workspace)
         now = self._now()
         run_id = uuid.uuid4().hex
         stages = tuple(
@@ -147,29 +190,6 @@ class AnalysisService:
             )
             for index, analyzer in enumerate(plan)
         )
-        manifest = RunManifest(
-            run_id=run_id,
-            snapshot_id=snapshot.snapshot_id,
-            source_id=snapshot.source_id,
-            account_scope=snapshot.account_scope,
-            group_id=snapshot.group_id,
-            time_range=snapshot.time_range,
-            timezone=snapshot.timezone,
-            coverage=snapshot.coverage.to_dict(),
-            config_version=context.config_version,
-            model_id=context.model_id,
-            prompt_version=context.prompt_version,
-            created_at=now,
-            stages=stages,
-        )
-        request = _Request(
-            run_id=run_id,
-            snapshot=snapshot,
-            context=context,
-            plan=plan,
-            stages=stages,
-            cancellation=Cancellation(),
-        )
         event = threading.Event()
 
         with self._admission_lock:
@@ -177,10 +197,46 @@ class AnalysisService:
                 raise AnalysisServiceClosed("analysis service is closed")
             if self._queue.full():
                 raise AnalysisQueueFull(f"analysis queue is full (capacity={self.queue_capacity})")
+
+            run_dir = self.run_workspace(run_id)
+            run_dir.mkdir(parents=True, exist_ok=False)
+            context = replace(
+                context or AnalysisContext(),
+                run_id=run_id,
+                workspace=run_dir,
+            )
+            manifest = RunManifest(
+                run_id=run_id,
+                snapshot_id=snapshot.snapshot_id,
+                source_id=snapshot.source_id,
+                account_scope=snapshot.account_scope,
+                group_id=snapshot.group_id,
+                time_range=snapshot.time_range,
+                timezone=snapshot.timezone,
+                coverage=snapshot.coverage.to_dict(),
+                config_version=context.config_version,
+                model_id=context.model_id,
+                prompt_version=context.prompt_version,
+                created_at=now,
+                stages=stages,
+            )
+            request = _Request(
+                run_id=run_id,
+                snapshot=snapshot,
+                context=context,
+                plan=plan,
+                stages=stages,
+                cancellation=Cancellation(),
+            )
             with self._state_lock:
                 if self._closed:
+                    self._discard_empty_run_dir(run_id)
                     raise AnalysisServiceClosed("analysis service is closed")
-                self.store.create_run(manifest)
+                try:
+                    self.store.create_run(manifest)
+                except BaseException:
+                    self._discard_empty_run_dir(run_id)
+                    raise
                 self._events[run_id] = event
                 self._tokens[run_id] = request.cancellation
                 try:
@@ -189,6 +245,7 @@ class AnalysisService:
                     self._events.pop(run_id, None)
                     self._tokens.pop(run_id, None)
                     self.store.cancel_run(run_id, now=self._now())
+                    self._discard_empty_run_dir(run_id)
                     raise AnalysisQueueFull(
                         f"analysis queue is full (capacity={self.queue_capacity})"
                     ) from error
@@ -202,6 +259,24 @@ class AnalysisService:
         """Return recent run records, newest first."""
         return self.store.list_runs(limit)
 
+    def run_workspace(self, run_id: str) -> Path:
+        """Return the per-run directory used for artifacts and analyzer files."""
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or run_id in (".", "..")
+            or "/" in run_id
+            or "\\" in run_id
+        ):
+            raise ValueError("run_id must be a non-empty path component")
+        return self.workspace / "runs" / run_id
+
+    def _discard_empty_run_dir(self, run_id: str) -> None:
+        try:
+            self.run_workspace(run_id).rmdir()
+        except OSError:
+            pass
+
     def wait(self, run_id: str, timeout: float | None = None) -> RunRecord:
         """Wait for a terminal run state and return its record."""
         if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))):
@@ -209,10 +284,14 @@ class AnalysisService:
         if timeout is not None and timeout < 0:
             raise ValueError("timeout must not be negative")
         event = self._events.get(run_id)
-        if event is not None:
-            completed = event.wait(timeout)
-        else:
-            completed = True
+        if event is None:
+            record = self.store.get_run(run_id)
+            if record is None:
+                raise KeyError(run_id)
+            if record.status.is_terminal:
+                return record
+            raise RuntimeError(f"analysis run {run_id} has no completion event")
+        completed = event.wait(timeout)
         record = self.store.get_run(run_id)
         if record is None:
             raise KeyError(run_id)
@@ -230,27 +309,34 @@ class AnalysisService:
                 return False
             changed = self.store.cancel_run(run_id, now=self._now())
             if changed:
-                token = self._tokens.get(run_id)
+                if record.status is RunStatus.queued:
+                    self._queue.remove(run_id)
+                    self._discard_empty_run_dir(run_id)
+                token = self._tokens.pop(run_id, None)
+                event = self._events.pop(run_id, None)
                 if token is not None:
                     token.cancel()
-                event = self._events.get(run_id)
                 if event is not None:
                     event.set()
             return changed
 
     def close(self, *, wait: bool = True, timeout: float = 5.0) -> None:
         with self._state_lock:
-            if self._closed:
-                return
             self._closed = True
             self._stop.set()
+            self._queue.clear()
+            try:
+                self.store.recover_interrupted(now=self._now())
+            except Exception as error:
+                LOG.error("analysis shutdown recovery failed error=%s", type(error).__name__)
+            for event in self._events.values():
+                event.set()
+            self._events.clear()
             for token in self._tokens.values():
                 token.cancel()
+            self._tokens.clear()
         if wait and self._worker is not threading.current_thread():
             self._worker.join(timeout=timeout)
-            self.store.recover_interrupted(now=self._now())
-            for event in list(self._events.values()):
-                event.set()
 
     def __enter__(self) -> "AnalysisService":
         return self
@@ -264,6 +350,8 @@ class AnalysisService:
                 request = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            if self._stop.is_set():
+                break
             try:
                 self._execute(request)
             except Exception as error:  # pragma: no cover - defensive boundary
@@ -273,8 +361,6 @@ class AnalysisService:
                     type(error).__name__,
                 )
                 self._abort_run(request.run_id)
-            finally:
-                self._queue.task_done()
 
     def _abort_run(self, run_id: str) -> None:
         with self._state_lock:
@@ -470,6 +556,8 @@ class AnalysisService:
                 raise AnalysisResultError("analyzer diagnostics must be strings")
 
     def _signal(self, run_id: str) -> None:
-        event = self._events.get(run_id)
-        if event is not None:
-            event.set()
+        with self._state_lock:
+            event = self._events.pop(run_id, None)
+            self._tokens.pop(run_id, None)
+            if event is not None:
+                event.set()

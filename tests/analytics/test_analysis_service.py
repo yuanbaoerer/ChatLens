@@ -28,7 +28,6 @@ class AnalysisServiceTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.snapshot = make_snapshot()
-        self.services: list[AnalysisService] = []
 
     def service(self, analyzers, *, capacity: int = 8) -> AnalysisService:
         service = AnalysisService(
@@ -36,7 +35,6 @@ class AnalysisServiceTests(unittest.TestCase):
             self.root / "workspace",
             queue_capacity=capacity,
         )
-        self.services.append(service)
         self.addCleanup(service.close)
         return service
 
@@ -145,10 +143,12 @@ class AnalysisServiceTests(unittest.TestCase):
         self.assertEqual(cancelled.stages[0].diagnostics, ("run_cancelled",))
         self.assertFalse(service.cancel(second))
 
+        third = service.submit(self.snapshot)
         release.set()
         self.assertEqual(service.wait(first, timeout=5).status, RunStatus.succeeded)
+        self.assertEqual(service.wait(third, timeout=5).status, RunStatus.succeeded)
         self.assertEqual(service.get(second).status, RunStatus.cancelled)
-        self.assertEqual(calls, ["blocking"])
+        self.assertEqual(calls, ["blocking", "blocking"])
 
     def test_running_cancel_is_not_overwritten_by_late_success(self):
         started = threading.Event()
@@ -266,6 +266,31 @@ class AnalysisServiceTests(unittest.TestCase):
         failed_stage = next(stage for stage in record.stages if stage.analyzer_id == "missing-artifact")
         self.assertEqual(failed_stage.error_type, "AnalysisResultError")
 
+    def test_artifacts_are_scoped_to_each_run(self):
+        seen: list[tuple[str | None, Path]] = []
+
+        def runner(context, _snapshot):
+            seen.append((context.run_id, context.workspace))
+            (context.workspace / "same.txt").write_text(context.run_id, encoding="utf-8")
+            return AnalysisResult(
+                evidence_ids=("message-1",),
+                artifacts=(ArtifactRef("same.txt"),),
+            )
+
+        service = self.service([SyntheticAnalyzer("scoped", runner=runner)])
+        first = service.submit(self.snapshot)
+        first_record = service.wait(first, timeout=5)
+        second = service.submit(self.snapshot)
+        second_record = service.wait(second, timeout=5)
+
+        self.assertEqual(first_record.status, RunStatus.succeeded)
+        self.assertEqual(second_record.status, RunStatus.succeeded)
+        self.assertEqual([item[0] for item in seen], [first, second])
+        self.assertNotEqual(seen[0][1], seen[1][1])
+        self.assertEqual(service.run_workspace(first).parent, service.workspace / "runs")
+        self.assertEqual((service.run_workspace(first) / "same.txt").read_text(encoding="utf-8"), first)
+        self.assertEqual((service.run_workspace(second) / "same.txt").read_text(encoding="utf-8"), second)
+
     def test_progress_is_queryable_and_finishes_at_one(self):
         progress_done = threading.Event()
         release = threading.Event()
@@ -295,6 +320,63 @@ class AnalysisServiceTests(unittest.TestCase):
         self.assertEqual(record.stages, ())
         self.assertEqual(record.diagnostics, ("no_analyzers",))
 
+    def test_close_terminalizes_running_and_queued_runs(self):
+        started = threading.Event()
+        release = threading.Event()
+        service = self.service(
+            [SyntheticAnalyzer(
+                "blocking",
+                started=started,
+                release=release,
+                ignore_cancel=True,
+            )],
+            capacity=1,
+        )
+        first = service.submit(self.snapshot)
+        self.assertTrue(started.wait(5))
+        second = service.submit(self.snapshot)
+
+        service.close(wait=False)
+        self.assertEqual(service.get(first).status, RunStatus.interrupted)
+        self.assertEqual(service.get(second).status, RunStatus.interrupted)
+        self.assertEqual(service.wait(first, timeout=5).status, RunStatus.interrupted)
+        self.assertEqual(service.wait(second, timeout=5).status, RunStatus.interrupted)
+
+        release.set()
+        service.close()
+        self.assertEqual(service.get(first).status, RunStatus.interrupted)
+        self.assertEqual(service.get(second).status, RunStatus.interrupted)
+
+    def test_wait_times_out_while_run_is_running(self):
+        started = threading.Event()
+        release = threading.Event()
+        service = self.service([
+            SyntheticAnalyzer("blocking", started=started, release=release)
+        ])
+        run_id = service.submit(self.snapshot)
+        self.assertTrue(started.wait(5))
+        with self.assertRaises(TimeoutError):
+            service.wait(run_id, timeout=0.01)
+        release.set()
+        self.assertEqual(service.wait(run_id, timeout=5).status, RunStatus.succeeded)
+
+    def test_success_logs_do_not_echo_analyzer_output(self):
+        secret = "TOPSECRET_RESULT_TEXT"
+        service = self.service([
+            SyntheticAnalyzer(
+                "success",
+                result=AnalysisResult(
+                    output={"secret": secret},
+                    evidence_ids=("message-1",),
+                ),
+            )
+        ])
+        with self.assertLogs("analytics.analysis_service", level="INFO") as captured:
+            run_id = service.submit(self.snapshot)
+            record = service.wait(run_id, timeout=5)
+        self.assertEqual(record.status, RunStatus.succeeded)
+        self.assertNotIn(secret, "\n".join(captured.output))
+
     def test_restart_marks_only_unfinished_runs_interrupted(self):
         workspace = self.root / "recovery"
         store = RunStore(workspace)
@@ -321,7 +403,6 @@ class AnalysisServiceTests(unittest.TestCase):
         done_before = store.get_run("done")
 
         service = AnalysisService(AnalyzerRegistry(()), workspace, store=store)
-        self.services.append(service)
         self.addCleanup(service.close)
         self.assertEqual(service.recovered_runs, 2)
 

@@ -59,6 +59,7 @@ class AnalysisContext:
     config: Mapping[str, Any] = field(default_factory=dict)
     model_id: str | None = None
     prompt_version: str | None = None
+    run_id: str | None = None
     workspace: Path | None = None
 
     def __post_init__(self) -> None:
@@ -71,6 +72,8 @@ class AnalysisContext:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"{name} must be a non-empty string or None")
+        if self.run_id is not None and (not isinstance(self.run_id, str) or not self.run_id):
+            raise ValueError("run_id must be a non-empty string or None")
         if self.workspace is not None:
             object.__setattr__(self, "workspace", Path(self.workspace))
 
