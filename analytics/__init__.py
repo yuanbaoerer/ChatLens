@@ -16,7 +16,7 @@ from analytics.analysis_store import (
     StageSpec,
     StageStatus,
 )
-from analytics.analyzers import MediaDuplicateAnalyzer
+from analytics.analyzers import MediaDuplicateAnalyzer, TextLinkDuplicateAnalyzer
 from analytics.analyzer import (
     AnalysisCancelled,
     AnalysisContext,
@@ -94,6 +94,7 @@ __all__ = [
     "StageRecord",
     "StageSpec",
     "StageStatus",
+    "TextLinkDuplicateAnalyzer",
     "TimeRange",
     "TypeCoverage",
     "default_registry",
