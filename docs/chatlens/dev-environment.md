@@ -131,7 +131,7 @@ python scripts/package_release.py .\release --no-source
 
 ## 6. 隐私、凭据与本地数据卫生
 
-1. **禁止入库项**：真实微信数据库（`*.db`、`*.db-wal`、`*.db-shm`）、密钥（`*keys*.json`、`*.pem`）、真实导出聊天记录与媒体（`exports/`、`snapshots/`）、模型 API Key（`.env*`）、个人配置（`config.json`）。这些模式已在 `.gitignore:15-31` 中忽略；后续 CL-01/CL-02 新增本地分析工作区或本地评估数据集目录时，需先核对并补充 `.gitignore` 规则再写入文件。
+1. **禁止入库项**：真实微信数据库（`*.db`、`*.db-wal`、`*.db-shm`）、密钥（`*keys*.json`、`*.pem`）、真实导出聊天记录与媒体（`exports/`、`snapshots/`）、模型 API Key（`.env*`）、个人配置（`config.json`）。这些模式已在 `.gitignore:15-31` 中忽略；后续 CL-01/CL-02 新增本地分析工作区或本地评估数据集目录时，需先核对并补充 `.gitignore` 规则再写入文件。分析工作区应位于仓库之外；`AnalysisService` 在 workspace 上持有 `.analysis-service.lock`，同一工作区只允许一个实例，避免启动/关闭恢复误中断其他实例的运行。
 2. **本地授权样本隔离**：在 Windows 导出用于评估或调试的真实授权群聊 JSONL/媒体文件，应统一存放在仓库之外（如 Windows `C:\Temp\chatlens-local-eval\` 或 WSL `~/chatlens-local-eval/`），通过环境变量传参给本地评估脚本，避免误 `git add`。
 3. **API 密钥管理**：开发期仅使用本地环境变量或 Windows 凭据存储，不在源码、测试夹具或日志中打印明文密钥与原始群成员 ID。
 4. **日志与遥测**：不自动上传聊天记录、不静默触发远端媒体下载、不在错误信息中回显聊天正文或密钥片段（与 `core/service.py:427-430` 的脱敏约定保持一致）。

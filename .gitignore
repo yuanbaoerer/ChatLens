@@ -29,3 +29,10 @@ signing-key.pem
 *private*.pem
 publisher-state/
 /ui-publisher/
+
+# ChatLens local analysis workspace
+analysis-runs.db
+analysis-runs.db-wal
+analysis-runs.db-shm
+.analysis-service.lock
+runs/
