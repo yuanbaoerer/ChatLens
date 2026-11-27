@@ -52,13 +52,15 @@ class AnalysisContext:
     """Per-run metadata and configuration supplied to an analyzer.
 
     ``config`` is intentionally not persisted by the run store; only its
-    version and optional model/prompt identifiers are recorded.
+    version and optional provider/model/prompt identifiers are recorded.
     """
 
     config_version: str = "cl-02-default"
     config: Mapping[str, Any] = field(default_factory=dict)
     model_id: str | None = None
     prompt_version: str | None = None
+    provider: str | None = None
+    prompt_hash: str | None = None
     run_id: str | None = None
     workspace: Path | None = None
 
@@ -68,7 +70,7 @@ class AnalysisContext:
         if not isinstance(self.config, Mapping):
             raise TypeError("config must be a mapping")
         object.__setattr__(self, "config", MappingProxyType(dict(self.config)))
-        for name in ("model_id", "prompt_version"):
+        for name in ("model_id", "prompt_version", "provider", "prompt_hash"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"{name} must be a non-empty string or None")
@@ -120,7 +122,12 @@ class ArtifactRef:
 
 @dataclass(frozen=True)
 class AnalysisResult:
-    """Structured output, evidence references, and diagnostics from one stage."""
+    """Structured output, evidence references, and diagnostics from one stage.
+
+    The service persists ``output`` and ``diagnostics`` verbatim. Analyzers must
+    not put raw chat text or credentials there unless the feature explicitly
+    requires quoted evidence.
+    """
 
     output: Mapping[str, Any] = field(default_factory=dict)
     evidence_ids: tuple[str, ...] = ()

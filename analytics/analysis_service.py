@@ -1,8 +1,10 @@
 """Single-worker analysis service with bounded queue, progress and cancellation."""
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import os
 import queue
 import threading
 import uuid
@@ -40,6 +42,53 @@ class AnalysisQueueFull(RuntimeError):
 
 class AnalysisServiceClosed(RuntimeError):
     """Raised when submitting to a closed analysis service."""
+
+
+class AnalysisWorkspaceBusy(RuntimeError):
+    """Raised when another analysis service already owns the workspace."""
+
+
+_MAX_PROGRESS_MESSAGE = 500
+
+
+def _acquire_workspace_lock(workspace: Path) -> int:
+    lock_path = workspace / ".analysis-service.lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(fd)
+        raise AnalysisWorkspaceBusy(
+            f"analysis workspace is already in use: {workspace}"
+        ) from error
+    return fd
+
+
+def _release_workspace_lock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 class AnalysisResultError(ValueError):
@@ -93,10 +142,12 @@ class _BoundedJobQueue:
                     return True
             return False
 
-    def clear(self) -> None:
+    def drain(self) -> tuple[_Request, ...]:
         with self._condition:
+            items = tuple(self._items)
             self._items.clear()
             self._condition.notify_all()
+            return items
 
 
 def _snapshot_evidence_ids(snapshot: Snapshot) -> set[str]:
@@ -136,33 +187,44 @@ class AnalysisService:
         if isinstance(queue_capacity, bool) or not isinstance(queue_capacity, int) or queue_capacity < 1:
             raise ValueError("queue_capacity must be a positive integer")
         self.workspace = Path(workspace).resolve()
-        if store is None:
-            store = RunStore(self.workspace)
-        elif not isinstance(store, RunStore):
-            raise TypeError("store must be a RunStore")
-        elif store.workspace != self.workspace:
-            raise ValueError("store workspace does not match service workspace")
+        if self.workspace.exists() and not self.workspace.is_dir():
+            raise ValueError("analysis workspace must be a directory")
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self._lock_guard = threading.Lock()
+        self._lock_fd: int | None = None
+        self._lock_fd = _acquire_workspace_lock(self.workspace)
+        try:
+            if store is None:
+                store = RunStore(self.workspace)
+            elif not isinstance(store, RunStore):
+                raise TypeError("store must be a RunStore")
+            elif store.workspace != self.workspace:
+                raise ValueError("store workspace does not match service workspace")
 
-        self.registry = registry
-        self.store = store
-        self.queue_capacity = queue_capacity
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+            self.registry = registry
+            self.store = store
+            self.queue_capacity = queue_capacity
+            self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-        self._queue = _BoundedJobQueue(queue_capacity)
-        self._admission_lock = threading.Lock()
-        self._state_lock = threading.RLock()
-        self._stop = threading.Event()
-        self._closed = False
-        self._events: dict[str, threading.Event] = {}
-        self._tokens: dict[str, Cancellation] = {}
+            self._queue = _BoundedJobQueue(queue_capacity)
+            self._admission_lock = threading.Lock()
+            self._state_lock = threading.RLock()
+            self._stop = threading.Event()
+            self._closed = False
+            self._events: dict[str, threading.Event] = {}
+            self._tokens: dict[str, Cancellation] = {}
 
-        self.recovered_runs = self.store.recover_interrupted(now=self._now())
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="chatlens-analysis",
-            daemon=True,
-        )
-        self._worker.start()
+            self.recovered_runs = self.store.recover_interrupted(now=self._now())
+            self._cleanup_empty_run_dirs()
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="chatlens-analysis",
+                daemon=True,
+            )
+            self._worker.start()
+        except BaseException:
+            self._release_lock()
+            raise
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -191,6 +253,40 @@ class AnalysisService:
             for index, analyzer in enumerate(plan)
         )
         event = threading.Event()
+        supplied_context = context or AnalysisContext()
+        run_dir = self.run_workspace(run_id)
+        context = replace(
+            supplied_context,
+            run_id=run_id,
+            workspace=run_dir,
+            config=copy.deepcopy(dict(supplied_context.config)),
+        )
+        manifest = RunManifest(
+            run_id=run_id,
+            snapshot_id=snapshot.snapshot_id,
+            source_id=snapshot.source_id,
+            account_scope=snapshot.account_scope,
+            group_id=snapshot.group_id,
+            time_range=snapshot.time_range,
+            timezone=snapshot.timezone,
+            coverage=snapshot.coverage.to_dict(),
+            config_version=context.config_version,
+            model_id=context.model_id,
+            prompt_version=context.prompt_version,
+            provider=context.provider,
+            prompt_hash=context.prompt_hash,
+            created_at=now,
+            stages=stages,
+            diagnostics=tuple(snapshot.diagnostics),
+        )
+        request = _Request(
+            run_id=run_id,
+            snapshot=snapshot,
+            context=context,
+            plan=plan,
+            stages=stages,
+            cancellation=Cancellation(),
+        )
 
         with self._admission_lock:
             if self._closed:
@@ -198,40 +294,10 @@ class AnalysisService:
             if self._queue.full():
                 raise AnalysisQueueFull(f"analysis queue is full (capacity={self.queue_capacity})")
 
-            run_dir = self.run_workspace(run_id)
-            run_dir.mkdir(parents=True, exist_ok=False)
-            context = replace(
-                context or AnalysisContext(),
-                run_id=run_id,
-                workspace=run_dir,
-            )
-            manifest = RunManifest(
-                run_id=run_id,
-                snapshot_id=snapshot.snapshot_id,
-                source_id=snapshot.source_id,
-                account_scope=snapshot.account_scope,
-                group_id=snapshot.group_id,
-                time_range=snapshot.time_range,
-                timezone=snapshot.timezone,
-                coverage=snapshot.coverage.to_dict(),
-                config_version=context.config_version,
-                model_id=context.model_id,
-                prompt_version=context.prompt_version,
-                created_at=now,
-                stages=stages,
-            )
-            request = _Request(
-                run_id=run_id,
-                snapshot=snapshot,
-                context=context,
-                plan=plan,
-                stages=stages,
-                cancellation=Cancellation(),
-            )
             with self._state_lock:
                 if self._closed:
-                    self._discard_empty_run_dir(run_id)
                     raise AnalysisServiceClosed("analysis service is closed")
+                run_dir.mkdir(parents=True, exist_ok=False)
                 try:
                     self.store.create_run(manifest)
                 except BaseException:
@@ -276,6 +342,24 @@ class AnalysisService:
             self.run_workspace(run_id).rmdir()
         except OSError:
             pass
+
+    def _cleanup_empty_run_dirs(self) -> None:
+        runs = self.workspace / "runs"
+        if not runs.is_dir():
+            return
+        for path in runs.iterdir():
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+    def _release_lock(self) -> None:
+        with self._lock_guard:
+            fd = self._lock_fd
+            self._lock_fd = None
+        if fd is not None:
+            _release_workspace_lock(fd)
 
     def wait(self, run_id: str, timeout: float | None = None) -> RunRecord:
         """Wait for a terminal run state and return its record."""
@@ -324,7 +408,8 @@ class AnalysisService:
         with self._state_lock:
             self._closed = True
             self._stop.set()
-            self._queue.clear()
+            for request in self._queue.drain():
+                self._discard_empty_run_dir(request.run_id)
             try:
                 self.store.recover_interrupted(now=self._now())
             except Exception as error:
@@ -337,6 +422,8 @@ class AnalysisService:
             self._tokens.clear()
         if wait and self._worker is not threading.current_thread():
             self._worker.join(timeout=timeout)
+        if not self._worker.is_alive():
+            self._release_lock()
 
     def __enter__(self) -> "AnalysisService":
         return self
@@ -345,22 +432,28 @@ class AnalysisService:
         self.close()
 
     def _worker_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                request = self._queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if self._stop.is_set():
-                break
-            try:
-                self._execute(request)
-            except Exception as error:  # pragma: no cover - defensive boundary
-                LOG.error(
-                    "analysis worker failed run_id=%s error=%s",
-                    request.run_id,
-                    type(error).__name__,
-                )
-                self._abort_run(request.run_id)
+        try:
+            while not self._stop.is_set():
+                try:
+                    request = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if self._stop.is_set():
+                    break
+                try:
+                    self._execute(request)
+                except Exception as error:  # pragma: no cover - defensive boundary
+                    LOG.error(
+                        "analysis worker failed run_id=%s error=%s",
+                        request.run_id,
+                        type(error).__name__,
+                    )
+                    self._abort_run(request.run_id)
+        finally:
+            if self._closed:
+                with self._state_lock:
+                    if self._closed:
+                        self._release_lock()
 
     def _abort_run(self, run_id: str) -> None:
         with self._state_lock:
@@ -519,9 +612,11 @@ class AnalysisService:
         )
 
     def _progress_callback(self, run_id: str, analyzer_id: str):
-        def report(value: float, _message: str | None) -> None:
+        def report(value: float, message: str | None) -> None:
+            if message is not None:
+                message = message[:_MAX_PROGRESS_MESSAGE]
             with self._state_lock:
-                self.store.update_stage_progress(run_id, analyzer_id, value)
+                self.store.update_stage_progress(run_id, analyzer_id, value, message=message)
 
         return report
 

@@ -1,12 +1,15 @@
+import sqlite3
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from analytics.analysis_service import (
     AnalysisQueueFull,
     AnalysisService,
+    AnalysisWorkspaceBusy,
 )
 from analytics.analysis_store import (
     RunManifest,
@@ -78,6 +81,8 @@ class AnalysisServiceTests(unittest.TestCase):
                 config_version="config-v1",
                 model_id="synthetic-model",
                 prompt_version="prompt-v1",
+                provider="synthetic-provider",
+                prompt_hash="sha256:synthetic-prompt",
             ),
         )
         record = service.wait(run_id, timeout=5)
@@ -92,6 +97,8 @@ class AnalysisServiceTests(unittest.TestCase):
         self.assertEqual(record.config_version, "config-v1")
         self.assertEqual(record.model_id, "synthetic-model")
         self.assertEqual(record.prompt_version, "prompt-v1")
+        self.assertEqual(record.provider, "synthetic-provider")
+        self.assertEqual(record.prompt_hash, "sha256:synthetic-prompt")
         self.assertIsNotNone(record.started_at)
         self.assertIsNotNone(record.finished_at)
         alpha = record.stages[0]
@@ -307,9 +314,11 @@ class AnalysisServiceTests(unittest.TestCase):
         running = service.get(run_id)
         self.assertEqual(running.status, RunStatus.running)
         self.assertEqual(running.stages[0].progress, 0.5)
+        self.assertEqual(running.stages[0].progress_message, "synthetic progress")
         release.set()
         finished = service.wait(run_id, timeout=5)
         self.assertEqual(finished.stages[0].progress, 1.0)
+        self.assertEqual(finished.stages[0].progress_message, "synthetic progress")
         self.assertEqual(finished.status, RunStatus.succeeded)
 
     def test_empty_registry_finishes_without_stages(self):
@@ -337,6 +346,7 @@ class AnalysisServiceTests(unittest.TestCase):
         second = service.submit(self.snapshot)
 
         service.close(wait=False)
+        self.assertFalse(service.run_workspace(second).exists())
         self.assertEqual(service.get(first).status, RunStatus.interrupted)
         self.assertEqual(service.get(second).status, RunStatus.interrupted)
         self.assertEqual(service.wait(first, timeout=5).status, RunStatus.interrupted)
@@ -433,6 +443,113 @@ class AnalysisServiceTests(unittest.TestCase):
         for path in (self.root / "workspace").rglob("*"):
             if path.is_file():
                 self.assertNotIn(secret.encode(), path.read_bytes(), msg=str(path))
+
+    def test_successful_analyzer_does_not_copy_snapshot_text(self):
+        secret = "TOPSECRET_SUCCESS_CHAT_TEXT"
+        snapshot = make_snapshot(messages=[make_message(text=secret)])
+        service = self.service([
+            SyntheticAnalyzer(
+                "success",
+                result=AnalysisResult(
+                    output={"count": 1},
+                    evidence_ids=("message-1",),
+                ),
+            )
+        ])
+        run_id = service.submit(snapshot)
+        record = service.wait(run_id, timeout=5)
+        self.assertEqual(record.status, RunStatus.succeeded)
+        for path in (self.root / "workspace").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(secret.encode(), path.read_bytes(), msg=str(path))
+
+    def test_snapshot_diagnostics_are_preserved(self):
+        snapshot = replace(self.snapshot, diagnostics=("partial_import:missing_media",))
+        service = self.service([
+            SyntheticAnalyzer("fails", failure=RuntimeError("synthetic")),
+        ])
+        run_id = service.submit(snapshot)
+        record = service.wait(run_id, timeout=5)
+        self.assertEqual(record.status, RunStatus.failed)
+        self.assertIn("partial_import:missing_media", record.diagnostics)
+        self.assertIn("missing_stages:fails", record.diagnostics)
+
+    def test_manifest_validation_does_not_leave_run_directory(self):
+        service = self.service([])
+        with self.assertRaises(ValueError):
+            service.submit(replace(self.snapshot, group_id=""))
+        self.assertFalse((self.root / "workspace" / "runs").exists())
+
+    def test_second_service_on_same_workspace_is_rejected(self):
+        workspace = self.root / "shared-workspace"
+        first = AnalysisService(AnalyzerRegistry(()), workspace)
+        self.addCleanup(first.close)
+        with self.assertRaises(AnalysisWorkspaceBusy):
+            AnalysisService(AnalyzerRegistry(()), workspace)
+
+        first.close()
+        second = AnalysisService(AnalyzerRegistry(()), workspace)
+        self.addCleanup(second.close)
+        self.assertEqual(second.list_runs(), ())
+
+    def test_store_migrates_v1_schema_additively(self):
+        workspace = self.root / "v1-workspace"
+        workspace.mkdir()
+        database = workspace / "analysis-runs.db"
+        with sqlite3.connect(database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE runs (
+                    run_id TEXT, snapshot_id TEXT, source_id TEXT,
+                    account_scope TEXT, group_id TEXT, time_start TEXT,
+                    time_end TEXT, timezone TEXT, coverage_json TEXT,
+                    config_version TEXT, model_id TEXT, prompt_version TEXT,
+                    status TEXT, created_at TEXT, started_at TEXT,
+                    finished_at TEXT, diagnostics_json TEXT, artifacts_json TEXT
+                );
+                CREATE TABLE run_stages (
+                    run_id TEXT, stage_index INTEGER, analyzer_id TEXT,
+                    analyzer_version TEXT, prerequisites_json TEXT,
+                    supported_types_json TEXT, estimated_workload INTEGER,
+                    status TEXT, progress REAL, output_json TEXT,
+                    evidence_ids_json TEXT, diagnostics_json TEXT,
+                    artifacts_json TEXT, error_type TEXT, started_at TEXT,
+                    finished_at TEXT
+                );
+                PRAGMA user_version=1;
+                """
+            )
+        RunStore(workspace)
+        with sqlite3.connect(database) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+            stage_columns = {row[1] for row in connection.execute("PRAGMA table_info(run_stages)")}
+        self.assertEqual(version, 2)
+        self.assertIn("provider", run_columns)
+        self.assertIn("prompt_hash", run_columns)
+        self.assertIn("progress_message", stage_columns)
+
+    def test_submit_copies_nested_config(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def runner(context, _snapshot):
+            return AnalysisResult(
+                output={"threshold": context.config["thresholds"]["x"]},
+                evidence_ids=("message-1",),
+            )
+
+        config = {"thresholds": {"x": 1}}
+        service = self.service([
+            SyntheticAnalyzer("config", started=started, release=release, runner=runner),
+        ])
+        run_id = service.submit(self.snapshot, AnalysisContext(config=config))
+        self.assertTrue(started.wait(5))
+        config["thresholds"]["x"] = 99
+        release.set()
+        record = service.wait(run_id, timeout=5)
+        self.assertEqual(record.status, RunStatus.succeeded)
+        self.assertEqual(record.stages[0].output["threshold"], 1)
 
 
 if __name__ == "__main__":

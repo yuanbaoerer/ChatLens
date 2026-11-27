@@ -5,6 +5,7 @@ from analytics.analysis_service import (
     AnalysisResultError,
     AnalysisService,
     AnalysisServiceClosed,
+    AnalysisWorkspaceBusy,
 )
 from analytics.analysis_store import (
     RunManifest,
@@ -57,6 +58,7 @@ __all__ = [
     "AnalysisResultError",
     "AnalysisService",
     "AnalysisServiceClosed",
+    "AnalysisWorkspaceBusy",
     "Analyzer",
     "AnalyzerRegistry",
     "AnalyzerRegistryError",

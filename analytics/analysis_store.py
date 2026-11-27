@@ -133,14 +133,17 @@ class RunManifest:
     model_id: str | None
     prompt_version: str | None
     created_at: datetime
+    provider: str | None = None
+    prompt_hash: str | None = None
     stages: tuple[StageSpec, ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("run_id", "snapshot_id", "source_id", "account_scope", "group_id", "timezone", "config_version"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{name} must be a non-empty string")
-        for name in ("model_id", "prompt_version"):
+        for name in ("model_id", "prompt_version", "provider", "prompt_hash"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{name} must be a non-empty string or None")
@@ -151,6 +154,9 @@ class RunManifest:
         _ensure_aware(self.created_at, "created_at")
         object.__setattr__(self, "coverage", MappingProxyType(dict(self.coverage)))
         object.__setattr__(self, "stages", tuple(self.stages))
+        object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
+        if any(not isinstance(item, str) or not item for item in self.diagnostics):
+            raise ValueError("diagnostics must contain non-empty strings")
         indexes = [stage.index for stage in self.stages]
         if indexes != list(range(len(self.stages))):
             raise ValueError("stage indexes must be contiguous from zero")
@@ -169,6 +175,7 @@ class StageRecord:
     estimated_workload: int
     status: StageStatus
     progress: float
+    progress_message: str | None = None
     output: Mapping[str, Any] = field(default_factory=dict)
     evidence_ids: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
@@ -188,6 +195,8 @@ class StageRecord:
         object.__setattr__(self, "artifacts", tuple(self.artifacts))
         if not 0.0 <= float(self.progress) <= 1.0:
             raise ValueError("stage progress must be between 0 and 1")
+        if self.progress_message is not None and not isinstance(self.progress_message, str):
+            raise TypeError("stage progress message must be a string or None")
         if self.started_at is not None:
             _ensure_aware(self.started_at, "started_at")
         if self.finished_at is not None:
@@ -203,6 +212,7 @@ class StageRecord:
             "estimated_workload": self.estimated_workload,
             "status": self.status.value,
             "progress": self.progress,
+            "progress_message": self.progress_message,
             "output": dict(self.output),
             "evidence_ids": list(self.evidence_ids),
             "diagnostics": list(self.diagnostics),
@@ -226,6 +236,8 @@ class RunRecord:
     config_version: str
     model_id: str | None
     prompt_version: str | None
+    provider: str | None
+    prompt_hash: str | None
     status: RunStatus
     created_at: datetime
     started_at: datetime | None
@@ -260,6 +272,8 @@ class RunRecord:
             "config_version": self.config_version,
             "model_id": self.model_id,
             "prompt_version": self.prompt_version,
+            "provider": self.provider,
+            "prompt_hash": self.prompt_hash,
             "status": self.status.value,
             "created_at": _iso(self.created_at),
             "started_at": _iso(self.started_at),
@@ -284,6 +298,8 @@ CREATE TABLE IF NOT EXISTS runs (
     config_version TEXT NOT NULL,
     model_id TEXT,
     prompt_version TEXT,
+    provider TEXT,
+    prompt_hash TEXT,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     started_at TEXT,
@@ -302,6 +318,7 @@ CREATE TABLE IF NOT EXISTS run_stages (
     estimated_workload INTEGER NOT NULL,
     status TEXT NOT NULL,
     progress REAL NOT NULL DEFAULT 0,
+    progress_message TEXT,
     output_json TEXT NOT NULL DEFAULT '{}',
     evidence_ids_json TEXT NOT NULL DEFAULT '[]',
     diagnostics_json TEXT NOT NULL DEFAULT '[]',
@@ -322,11 +339,12 @@ CREATE INDEX IF NOT EXISTS idx_stages_run ON run_stages (run_id, stage_index);
 class RunStore:
     """SQLite run manifest and stage store inside an explicit local workspace.
 
-    The store persists snapshot metadata and aggregate coverage only. Messages,
-    sender identifiers and raw snapshot payloads are never written.
+    The store persists run/stage metadata and analyzer-provided output, evidence
+    references and artifacts. It never copies snapshot messages, sender
+    identifiers or raw snapshot payloads.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
     DB_FILENAME = "analysis-runs.db"
 
     def __init__(self, workspace: Path | str) -> None:
@@ -357,10 +375,27 @@ class RunStore:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, self.SCHEMA_VERSION):
+            if version not in (0, 1, self.SCHEMA_VERSION):
                 raise ValueError(f"unsupported analysis store schema version: {version}")
             connection.executescript(_SCHEMA)
-            connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+            if version < self.SCHEMA_VERSION:
+                self._add_missing_columns(connection)
+                connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+
+    @staticmethod
+    def _add_missing_columns(connection: sqlite3.Connection) -> None:
+        """Apply the additive v1 -> v2 schema changes without dropping data."""
+        for table, column, declaration in (
+            ("runs", "provider", "TEXT"),
+            ("runs", "prompt_hash", "TEXT"),
+            ("run_stages", "progress_message", "TEXT"),
+        ):
+            existing = {
+                row["name"]
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def create_run(self, manifest: RunManifest) -> None:
         with self._connect() as connection:
@@ -370,9 +405,9 @@ class RunStore:
                 INSERT INTO runs (
                     run_id, snapshot_id, source_id, account_scope, group_id,
                     time_start, time_end, timezone, coverage_json, config_version,
-                    model_id, prompt_version, status, created_at, started_at,
-                    finished_at, diagnostics_json, artifacts_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, '[]', '[]')
+                    model_id, prompt_version, provider, prompt_hash, status, created_at,
+                    started_at, finished_at, diagnostics_json, artifacts_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, '[]')
                 """,
                 (
                     manifest.run_id,
@@ -387,8 +422,11 @@ class RunStore:
                     manifest.config_version,
                     manifest.model_id,
                     manifest.prompt_version,
+                    manifest.provider,
+                    manifest.prompt_hash,
                     RunStatus.queued.value,
                     _iso(manifest.created_at),
+                    _json(list(manifest.diagnostics)),
                 ),
             )
             connection.executemany(
@@ -457,7 +495,7 @@ class RunStore:
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                UPDATE run_stages SET status = ?, started_at = ?, progress = 0
+                UPDATE run_stages SET status = ?, started_at = ?, progress = 0, progress_message = NULL
                 WHERE run_id = ? AND analyzer_id = ? AND status = ?
                   AND EXISTS (SELECT 1 FROM runs WHERE run_id = ? AND status = ?)
                 """,
@@ -473,19 +511,29 @@ class RunStore:
             )
             return cursor.rowcount == 1
 
-    def update_stage_progress(self, run_id: str, analyzer_id: str, progress: float) -> bool:
+    def update_stage_progress(
+        self,
+        run_id: str,
+        analyzer_id: str,
+        progress: float,
+        *,
+        message: str | None = None,
+    ) -> bool:
         value = float(progress)
         if not 0.0 <= value <= 1.0:
             raise ValueError("progress must be between 0 and 1")
+        if message is not None and not isinstance(message, str):
+            raise TypeError("progress message must be a string or None")
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                UPDATE run_stages SET progress = ?
+                UPDATE run_stages SET progress = ?, progress_message = COALESCE(?, progress_message)
                 WHERE run_id = ? AND analyzer_id = ? AND status = ?
                   AND EXISTS (SELECT 1 FROM runs WHERE run_id = ? AND status = ?)
                 """,
                 (
                     value,
+                    message,
                     run_id,
                     analyzer_id,
                     StageStatus.running.value,
@@ -624,6 +672,17 @@ class RunStore:
             raise ValueError("finish_run requires a completed status")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT diagnostics_json FROM runs WHERE run_id = ? AND status = ?",
+                (run_id, RunStatus.running.value),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            merged = list(_loads(row["diagnostics_json"], []))
+            for diagnostic in diagnostics:
+                if diagnostic not in merged:
+                    merged.append(diagnostic)
             cursor = connection.execute(
                 """
                 UPDATE runs SET status = ?, finished_at = ?, diagnostics_json = ?, artifacts_json = ?
@@ -632,7 +691,7 @@ class RunStore:
                 (
                     status.value,
                     _iso(finished_at),
-                    _json(list(diagnostics)),
+                    _json(merged),
                     _json([artifact.to_dict() for artifact in artifacts]),
                     run_id,
                     RunStatus.running.value,
@@ -687,6 +746,8 @@ class RunStore:
             config_version=run["config_version"],
             model_id=run["model_id"],
             prompt_version=run["prompt_version"],
+            provider=run["provider"],
+            prompt_hash=run["prompt_hash"],
             status=RunStatus(run["status"]),
             created_at=_parse_datetime(run["created_at"]),
             started_at=_parse_datetime(run["started_at"]),
@@ -706,6 +767,7 @@ class RunStore:
             estimated_workload=row["estimated_workload"],
             status=StageStatus(row["status"]),
             progress=float(row["progress"]),
+            progress_message=row["progress_message"],
             output=_loads(row["output_json"], {}),
             evidence_ids=tuple(_loads(row["evidence_ids_json"], [])),
             diagnostics=tuple(_loads(row["diagnostics_json"], [])),
