@@ -192,12 +192,19 @@ class MediaDuplicateTests(unittest.TestCase):
             )
         return self.add_media(filename, **kwargs)
 
-    def analyze(self, *, media_root: Path | str | None = None):
-        config = {} if media_root is None else {"media_root": str(media_root)}
+    def analyze(
+        self,
+        *,
+        media_root: Path | str | None = None,
+        config: dict | None = None,
+    ):
+        settings = {} if media_root is None else {"media_root": str(media_root)}
+        if config:
+            settings.update(config)
         analyzer = MediaDuplicateAnalyzer()
         return analyzer.run(
             self.builder.build(),
-            AnalysisContext(config=config),
+            AnalysisContext(config=settings),
             Cancellation(),
             ProgressReporter(lambda _value, _message: None),
         )
@@ -348,6 +355,11 @@ class MediaDuplicateTests(unittest.TestCase):
             candidate["relation"] == "near_duplicate"
             for candidate in result.output["candidates"]
         ))
+        self.assertTrue(any(
+            rejected["reason"] == "visual_distance"
+            for rejected in result.output["rejected"]
+        ))
+        self.assertGreater(result.output["coverage"]["near_excluded"]["visual_distance"], 0)
 
     def test_gif_near_sequence_is_candidate(self):
         first = [image(), image(color="gold")]
@@ -527,7 +539,11 @@ class MediaDuplicateTests(unittest.TestCase):
             {"phash_threshold": 64},
             {"max_frames": 1},
             {"max_candidate_pairs": 0},
+            {"max_rejected_pairs": 0},
             {"max_near_groups": 0},
+            {"max_clusters": 0},
+            {"max_member_ids": 0},
+            {"max_evidence_ids": 0},
         ):
             with self.subTest(config=config):
                 with self.assertRaises(ValueError):
@@ -567,12 +583,59 @@ class MediaDuplicateTests(unittest.TestCase):
             frame_count=None,
             is_animated=None,
         )
+        self.add_media("valid.png", picture=image())
 
         result = self.analyze(media_root=self.media_root)
 
         self.assertEqual(result.output["clusters"], [])
         self.assertEqual(result.output["coverage"]["near_excluded"]["no_signature"], 1)
         self.assertIn("near_signature_unavailable:1", result.diagnostics)
+
+    def test_cluster_member_and_evidence_outputs_are_bounded(self):
+        first = image()
+        second = image(color="gold")
+        first_path = self.save_image("a.png", first)
+        second_path = self.save_image("b.png", second)
+        self.add_media("a.png", picture=first)
+        self.add_media("a-copy.png", picture=first, raw=first_path.read_bytes())
+        self.add_media("b.png", picture=second)
+        self.add_media("b-copy.png", picture=second, raw=second_path.read_bytes())
+
+        result = self.analyze(
+            media_root=self.media_root,
+            config={
+                "max_clusters": 1,
+                "max_member_ids": 1,
+                "max_evidence_ids": 1,
+            },
+        )
+
+        coverage = result.output["coverage"]
+        self.assertEqual(len(result.output["clusters"]), 1)
+        self.assertEqual(coverage["clusters_returned"], 1)
+        self.assertEqual(coverage["clusters_truncated"], 1)
+        self.assertEqual(coverage["exact_clusters"], 2)
+        self.assertEqual(len(result.output["clusters"][0]["member_evidence_ids"]), 1)
+        self.assertTrue(result.output["clusters"][0]["member_ids_truncated"])
+        self.assertEqual(len(result.evidence_ids), 1)
+        self.assertTrue(coverage["evidence_ids_truncated"])
+        self.assertIn("clusters_truncated:1", result.diagnostics)
+        self.assertIn("evidence_ids_truncated:3", result.diagnostics)
+
+    def test_rejected_edges_are_bounded(self):
+        self.add_media("a.png", picture=image(size=(64, 48)))
+        self.add_media("b.png", picture=image(size=(48, 64)))
+        self.add_media("c.png", picture=image(size=(80, 20)))
+
+        result = self.analyze(
+            media_root=self.media_root,
+            config={"max_rejected_pairs": 1},
+        )
+
+        coverage = result.output["coverage"]
+        self.assertEqual(len(result.output["rejected"]), 1)
+        self.assertTrue(coverage["near_rejected_truncated"])
+        self.assertIn("near_rejected_truncated:1", result.diagnostics)
 
     def test_cancellation_stops_before_media_scan(self):
         self.add_media("a.png", picture=image())
