@@ -8,7 +8,8 @@ Each task uses focused PR, tests, evidence, no auto-merge. Dependencies are logi
 |---|---|---|
 | CL-00 | Audit and hybrid development guide merged in [PR #2](https://github.com/yuanbaoerer/ChatLens/pull/2) (`720af50`). | WSL audit and synthetic read checks completed. Windows native build, WebView2 demo, WeChat integration and authorized media coverage remain pending. See the [Windows acceptance checklist](phase0-audit.md#72-无法在-wsl-完成的验证status-blocked--需在-windows-原生环境执行). |
 | CL-01 | Adapter and immutable snapshot merged in [PR #3](https://github.com/yuanbaoerer/ChatLens/pull/3) (`a3fd26e`). | 19 Analytics tests and 8 Moect baseline tests passed in WSL with Python 3.11 before merge. Import of an authorized Windows export remains pending. |
-| CL-02 | Next implementation task. | Planned scope is the typed analyzer registry, local execution with progress and cancellation, and SQLite run persistence. |
+| CL-02 | Analyzer/service/run lifecycle merged in [PR #4](https://github.com/yuanbaoerer/ChatLens/pull/4) (`7185173`). | 47 Analytics tests and 8 Moect baseline tests passed in WSL with Python 3.11 before merge. Windows native workspace-lock, WebView2 demo and WeChat integration checks remain pending. |
+| CL-03 | Next implementation task. | Planned scope is image/GIF/sticker detection with exact/near fixtures, missing-asset exclusion and caption/GIF safeguards. |
 
 ## Task roadmap
 
