@@ -12,7 +12,13 @@ from PIL import Image, ImageDraw
 
 from analytics.analysis_service import AnalysisService
 from analytics.analysis_store import RunStatus
-from analytics.analyzer import AnalysisContext, AnalyzerRegistry, Cancellation, ProgressReporter
+from analytics.analyzer import (
+    AnalysisCancelled,
+    AnalysisContext,
+    AnalyzerRegistry,
+    Cancellation,
+    ProgressReporter,
+)
 from analytics.analyzers.media_duplicates import MediaDuplicateAnalyzer
 from analytics.models import (
     ForwardChild,
@@ -88,9 +94,13 @@ class MediaDuplicateTests(unittest.TestCase):
             picture.save(path)
 
         if path is not None and path.is_file():
-            with Image.open(path) as opened:
-                actual_dimensions = opened.size
-                actual_frames = int(getattr(opened, "n_frames", 1))
+            try:
+                with Image.open(path) as opened:
+                    actual_dimensions = opened.size
+                    actual_frames = int(getattr(opened, "n_frames", 1))
+            except Exception:
+                actual_dimensions = None
+                actual_frames = None
         else:
             actual_dimensions = None
             actual_frames = None
@@ -145,6 +155,28 @@ class MediaDuplicateTests(unittest.TestCase):
         *,
         raw: bytes | None = None,
         duration: int = 100,
+        **kwargs,
+    ) -> tuple[str, MediaRef]:
+        path = self.media_root / filename
+        if raw is not None:
+            path.write_bytes(raw)
+        else:
+            frames[0].save(
+                path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=duration,
+                loop=0,
+            )
+        return self.add_media(filename, **kwargs)
+
+    def add_webp(
+        self,
+        filename: str,
+        frames: list[Image.Image],
+        *,
+        duration: int | list[int] = 100,
+        raw: bytes | None = None,
         **kwargs,
     ) -> tuple[str, MediaRef]:
         path = self.media_root / filename
@@ -401,6 +433,168 @@ class MediaDuplicateTests(unittest.TestCase):
         cluster, = result.output["clusters"]
         self.assertIn("parent/f0", cluster["member_evidence_ids"])
         self.assertIn("parent/f0", result.evidence_ids)
+
+    def test_animated_webp_duration_is_read_after_loading_frames(self):
+        frames = [image(), image(color="gold")]
+        self.add_webp("fast.webp", frames, duration=[100, 100], kind="emoji")
+        self.add_webp("slow.webp", frames, duration=[100, 500], kind="emoji")
+
+        result = self.analyze(media_root=self.media_root)
+
+        self.assertFalse(any(
+            candidate["relation"] == "near_duplicate"
+            for candidate in result.output["candidates"]
+        ))
+        self.assertGreater(result.output["coverage"]["near_excluded"]["duration"], 0)
+
+    def test_invalid_hash_is_recomputed_when_media_root_exists(self):
+        base = image()
+        variant = image(color="gold")
+        self.add_media("base.png", picture=base, content_hash="")
+        self.add_media("variant.png", picture=variant, content_hash="")
+
+        result = self.analyze(media_root=self.media_root)
+
+        self.assertEqual(result.output["clusters"], [])
+        self.assertEqual(result.output["coverage"]["analyzed"], 2)
+        self.assertEqual(result.output["coverage"]["excluded"]["invalid_hash"], 0)
+
+    def test_invalid_hash_without_media_root_is_excluded(self):
+        base = image()
+        self.add_media("base.png", picture=base, content_hash="")
+        self.add_media("variant.png", picture=image(color="gold"), content_hash="")
+
+        result = self.analyze()
+
+        self.assertEqual(result.output["clusters"], [])
+        self.assertEqual(result.evidence_ids, ())
+        self.assertEqual(result.output["coverage"]["excluded"]["invalid_hash"], 2)
+
+    def test_exact_hash_uses_current_file_when_media_root_exists(self):
+        base = image()
+        variant = image(color="gold")
+        base_hash = hashlib.sha256(base.tobytes()).hexdigest()
+        self.add_media("base.png", picture=base, content_hash=base_hash)
+        self.add_media("variant.png", picture=variant, content_hash=base_hash)
+
+        result = self.analyze(media_root=self.media_root)
+
+        self.assertEqual(result.output["clusters"], [])
+        self.assertEqual(result.output["coverage"]["analyzed"], 2)
+        self.assertIn("content_hash_mismatch:2", result.diagnostics)
+
+    def test_exact_image_with_changed_caption_is_template_cluster(self):
+        picture = image()
+        first_path = self.save_image("a.png", picture)
+        self.add_media("a.png", picture=picture, caption="caption one")
+        self.add_media("b.png", picture=picture, raw=first_path.read_bytes(), caption="caption two")
+
+        result = self.analyze(media_root=self.media_root)
+
+        cluster, = result.output["clusters"]
+        self.assertEqual(cluster["relation"], "same_meme_template")
+        self.assertTrue(cluster["cluster_id"].startswith("template:"))
+        self.assertTrue(cluster["caption_changed"])
+        self.assertEqual(cluster["caption_variant_count"], 2)
+        self.assertNotIn("caption_variants", cluster)
+        self.assertEqual(result.output["coverage"]["exact_clusters"], 0)
+        self.assertEqual(result.output["coverage"]["template_clusters"], 1)
+        self.assertEqual(result.output["coverage"]["confirmed_duplicate_occurrences"], 0)
+
+    def test_media_root_must_be_absolute_and_non_empty(self):
+        self.add_media("a.png", picture=image())
+        for invalid in ("", " ", "relative/media"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.analyze(media_root=invalid)
+
+    def test_config_rejects_out_of_range_values(self):
+        snapshot = self.builder.build()
+        analyzer = MediaDuplicateAnalyzer()
+        for config in (
+            {"phash_threshold": 64},
+            {"max_frames": 1},
+            {"max_candidate_pairs": 0},
+            {"max_near_groups": 0},
+        ):
+            with self.subTest(config=config):
+                with self.assertRaises(ValueError):
+                    analyzer.run(
+                        snapshot,
+                        AnalysisContext(config=config),
+                        Cancellation(),
+                        ProgressReporter(lambda _value, _message: None),
+                    )
+
+    def test_coverage_reconciles_kinds_and_confirmed_duplicates(self):
+        picture = image()
+        first_path = self.save_image("a.png", picture)
+        self.add_media("a.png", picture=picture)
+        self.add_media("b.png", picture=picture, raw=first_path.read_bytes())
+        self.add_media("voice.mp3", raw=b"synthetic voice", kind="voice", status=MediaStatus.readable)
+
+        result = self.analyze(media_root=self.media_root)
+
+        coverage = result.output["coverage"]
+        self.assertEqual(coverage["media_refs_seen"], 3)
+        self.assertEqual(coverage["excluded"]["unsupported_kind"], 1)
+        self.assertEqual(coverage["by_kind"]["image"]["eligible"], 2)
+        self.assertEqual(coverage["by_kind"]["image"]["analyzed"], 2)
+        self.assertEqual(coverage["by_kind"]["image"]["exact_occurrences"], 2)
+        self.assertEqual(coverage["by_kind"]["voice"]["unsupported_kind"], 1)
+        self.assertEqual(coverage["confirmed_duplicate_occurrences"], 1)
+
+    def test_corrupt_readable_media_is_reported_without_crashing(self):
+        path = self.media_root / "broken.png"
+        path.write_bytes(b"synthetic broken image")
+        self.add_media(
+            "broken.png",
+            status=MediaStatus.readable,
+            content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+            dimensions=None,
+            frame_count=None,
+            is_animated=None,
+        )
+
+        result = self.analyze(media_root=self.media_root)
+
+        self.assertEqual(result.output["clusters"], [])
+        self.assertEqual(result.output["coverage"]["near_excluded"]["no_signature"], 1)
+        self.assertIn("near_signature_unavailable:1", result.diagnostics)
+
+    def test_cancellation_stops_before_media_scan(self):
+        self.add_media("a.png", picture=image())
+        cancellation = Cancellation()
+        cancellation.cancel()
+        analyzer = MediaDuplicateAnalyzer()
+
+        with self.assertRaises(AnalysisCancelled):
+            analyzer.run(
+                self.builder.build(),
+                AnalysisContext(config={"media_root": str(self.media_root)}),
+                cancellation,
+                ProgressReporter(lambda _value, _message: None),
+            )
+
+    def test_resized_image_is_near_candidate(self):
+        picture = image()
+        self.add_media("a.png", picture=picture, caption="same")
+        self.add_media("b.png", picture=picture.resize((48, 36)), caption="same")
+
+        result = self.analyze(media_root=self.media_root)
+
+        candidate, = result.output["candidates"]
+        self.assertEqual(candidate["relation"], "near_duplicate")
+
+    def test_cropped_image_is_near_candidate(self):
+        picture = image()
+        self.add_media("a.png", picture=picture, caption="same")
+        self.add_media("b.png", picture=picture.crop((0, 0, 60, 45)), caption="same")
+
+        result = self.analyze(media_root=self.media_root)
+
+        candidate, = result.output["candidates"]
+        self.assertEqual(candidate["relation"], "near_duplicate")
 
     def test_media_path_outside_root_is_excluded(self):
         outside = self.root / "outside.png"

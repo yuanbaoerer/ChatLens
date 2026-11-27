@@ -5,15 +5,18 @@ kept separate from exact duplicates, and missing/unreadable/thumbnail assets are
 never treated as unique or duplicate evidence.
 
 Configuration (``AnalysisContext.config``):
-- ``media_root``: optional approved root for near-image reads. Without it exact
-  hash grouping still works, but perceptual candidates are skipped.
-- ``phash_threshold``: 0..64 Hamming threshold, default 10.
+- ``media_root``: optional absolute approved root for near-image reads. When
+  supplied, available files are re-hashed for exact grouping; without it valid
+  snapshot hashes are used and perceptual candidates are skipped.
+- ``phash_threshold``: 0..63 Hamming threshold, default 10.
 - ``max_candidate_pairs`` / ``max_near_groups``: bounded near comparison.
-- ``max_frames``: sampled GIF frames, 2..10 (default 5).
+- ``max_frames``: sampled GIF/WebP frames, 2..10 (default 5).
 
-Output keeps ``clusters`` (exact SHA-256 groups) separate from ``candidates``
+Output keeps ``clusters`` (exact SHA-256 groups with one caption, or
+``same_meme_template`` groups with changed captions) separate from ``candidates``
 (near, same-template or uncertain pairs). Caption comparison uses normalized
-message text only; OCR is intentionally not part of CL-03.
+message text only and emits a count, not caption hashes; OCR is intentionally
+not part of CL-03.
 """
 from __future__ import annotations
 
@@ -79,10 +82,16 @@ class _Config:
         if media_root is not None:
             if not isinstance(media_root, (str, Path)):
                 raise ValueError("media_root must be a path string or Path")
-            media_root = Path(media_root).expanduser().resolve()
+            text = str(media_root).strip()
+            if not text:
+                raise ValueError("media_root must not be empty")
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                raise ValueError("media_root must be an absolute path")
+            media_root = path.resolve()
         return cls(
             media_root=media_root,
-            phash_threshold=_bounded_int(raw, "phash_threshold", 10, 0, 64),
+            phash_threshold=_bounded_int(raw, "phash_threshold", 10, 0, 63),
             max_candidate_pairs=_bounded_int(raw, "max_candidate_pairs", 1000, 1, 100_000),
             max_near_groups=_bounded_int(raw, "max_near_groups", 5000, 1, 100_000),
             max_frames=_bounded_int(raw, "max_frames", 5, 2, 10),
@@ -94,6 +103,15 @@ def _bounded_int(raw: Mapping[str, Any], key: str, default: int, minimum: int, m
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ValueError(f"{key} must be an integer between {minimum} and {maximum}")
     return value
+
+
+def _normalize_sha256(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+        return None
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -115,17 +133,35 @@ class _Signature:
     duration_ms: int | None
 
 
+_KIND_STAT_KEYS = (
+    "media_refs",
+    "eligible",
+    "analyzed",
+    "thumbnail",
+    "unsupported_kind",
+    "missing",
+    "unsupported",
+    "failed",
+    "not_requested",
+    "no_path",
+    "outside_root",
+    "read_error",
+    "invalid_hash",
+    "hash_mismatch",
+    "exact_occurrences",
+    "template_occurrences",
+)
+
+
+def _new_kind_stats() -> dict[str, int]:
+    return {key: 0 for key in _KIND_STAT_KEYS}
+
+
 def _normalized_caption(text: str) -> str:
     normalized = " ".join(unicodedata.normalize("NFKC", str(text or "")).split())
     if normalized in _PLACEHOLDER_CAPTIONS:
         return ""
     return normalized
-
-
-def _caption_key(caption: str) -> str:
-    if not caption:
-        return "none"
-    return hashlib.sha256(caption.encode("utf-8")).hexdigest()[:16]
 
 
 def _is_image_ref(ref: MediaRef, owner_kind: str) -> bool:
@@ -204,6 +240,8 @@ def _load_signature(path: Path, *, max_frames: int) -> _Signature | None:
             duration_ms = 0
             for index in range(frame_count):
                 opened.seek(index)
+                # Pillow WebP exposes duration only after the frame is loaded.
+                opened.load()
                 duration_ms += int(opened.info.get("duration", 0) or 0)
                 if index in samples:
                     hashes.append(_phash(opened.copy()))
@@ -213,6 +251,8 @@ def _load_signature(path: Path, *, max_frames: int) -> _Signature | None:
         Image.DecompressionBombError,
         OSError,
         ValueError,
+        TypeError,
+        OverflowError,
         SyntaxError,
         EOFError,
         MemoryError,
@@ -302,6 +342,7 @@ class MediaDuplicateAnalyzer(Analyzer):
         owners, total_refs = _iter_media(snapshot)
         excluded = {
             "thumbnail": 0,
+            "unsupported_kind": 0,
             "missing": 0,
             "unsupported": 0,
             "failed": 0,
@@ -309,58 +350,83 @@ class MediaDuplicateAnalyzer(Analyzer):
             "no_path": 0,
             "outside_root": 0,
             "read_error": 0,
+            "invalid_hash": 0,
         }
+        by_kind: dict[str, dict[str, int]] = {}
         occurrences: list[_Occurrence] = []
         analyzed_evidence: set[str] = set()
         eligible = 0
         near_ready = 0
+        hash_mismatches = 0
 
         for index, (evidence_id, text, sender, sent_at, owner_kind, refs) in enumerate(owners):
             cancellation.check()
             if index % 64 == 0 and total_refs:
                 progress(min(0.5, 0.5 * index / max(1, len(owners))), "scanning media")
             for ref in refs:
+                kind_stats = by_kind.setdefault(str(ref.kind), _new_kind_stats())
+                kind_stats["media_refs"] += 1
                 if not _is_image_ref(ref, owner_kind):
+                    excluded["unsupported_kind"] += 1
+                    kind_stats["unsupported_kind"] += 1
                     continue
                 if ref.role is MediaRole.thumbnail or ref.quality is MediaQuality.thumbnail:
                     excluded["thumbnail"] += 1
+                    kind_stats["thumbnail"] += 1
                     continue
                 eligible += 1
+                kind_stats["eligible"] += 1
                 if ref.status is not MediaStatus.readable:
-                    excluded[ref.status.value if ref.status.value in excluded else "failed"] += 1
+                    key = ref.status.value if ref.status.value in excluded else "failed"
+                    excluded[key] += 1
+                    kind_stats[key] += 1
                     continue
 
-                content_hash = ref.content_hash
+                raw_content_hash = ref.content_hash
+                content_hash = _normalize_sha256(raw_content_hash)
+                invalid_hash = raw_content_hash is not None and content_hash is None
                 relative_path = ref.relative_path
                 readable_path: Path | None = None
                 if relative_path is not None:
                     if config.media_root is None:
-                        # Exact grouping can still use the snapshot hash without reading bytes.
+                        # Exact grouping can still use a valid snapshot hash without reading bytes.
                         if content_hash is None:
-                            excluded["no_path"] += 1
+                            key = "invalid_hash" if invalid_hash else "no_path"
+                            excluded[key] += 1
+                            kind_stats[key] += 1
                             continue
                     else:
                         readable_path = resolve_safe_path(config.media_root, relative_path)
                         if readable_path is None:
                             excluded["outside_root"] += 1
+                            kind_stats["outside_root"] += 1
                             continue
                         try:
                             if not readable_path.is_file():
                                 excluded["missing"] += 1
+                                kind_stats["missing"] += 1
                                 continue
                             if readable_path.stat().st_size > _MAX_MEDIA_FILE_BYTES:
                                 excluded["read_error"] += 1
+                                kind_stats["read_error"] += 1
                                 continue
-                            if content_hash is None:
-                                content_hash = _sha256_file(readable_path)
+                            actual_hash = _sha256_file(readable_path)
+                            if content_hash is not None and content_hash != actual_hash:
+                                hash_mismatches += 1
+                                kind_stats["hash_mismatch"] += 1
+                            content_hash = actual_hash
                         except OSError:
                             excluded["read_error"] += 1
+                            kind_stats["read_error"] += 1
                             continue
                 if content_hash is None:
-                    excluded["no_path"] += 1
+                    key = "invalid_hash" if invalid_hash else "no_path"
+                    excluded[key] += 1
+                    kind_stats[key] += 1
                     continue
 
                 analyzed_evidence.add(evidence_id)
+                kind_stats["analyzed"] += 1
                 occurrences.append(_Occurrence(
                     evidence_id=evidence_id,
                     kind=ref.kind,
@@ -383,11 +449,21 @@ class MediaDuplicateAnalyzer(Analyzer):
             if len(group) < 2:
                 continue
             group = sorted(group, key=lambda item: (item.sent_at, item.evidence_id))
-            captions = sorted({_caption_key(item.caption) for item in group})
+            caption_variant_count = len({item.caption for item in group})
+            relation = (
+                "same_meme_template"
+                if caption_variant_count > 1
+                else "exact_duplicate"
+            )
+            prefix = "template" if relation == "same_meme_template" else "exact"
             evidence_ids = sorted({item.evidence_id for item in group})
+            for item in group:
+                kind_stats = by_kind.setdefault(item.kind, _new_kind_stats())
+                key = "template_occurrences" if relation == "same_meme_template" else "exact_occurrences"
+                kind_stats[key] += 1
             clusters.append({
-                "cluster_id": f"exact:{content_hash}",
-                "relation": "exact_duplicate",
+                "cluster_id": f"{prefix}:{content_hash}",
+                "relation": relation,
                 "representative_evidence_id": group[0].evidence_id,
                 "member_evidence_ids": evidence_ids,
                 "occurrence_count": len(group),
@@ -395,12 +471,14 @@ class MediaDuplicateAnalyzer(Analyzer):
                 "first_seen": _iso(group[0].sent_at),
                 "last_seen": _iso(group[-1].sent_at),
                 "media_kinds": sorted({item.kind for item in group}),
-                "caption_variants": captions,
-                "caption_changed": len(captions) > 1,
+                "caption_variant_count": caption_variant_count,
+                "caption_changed": caption_variant_count > 1,
                 "content_hash": content_hash,
             })
 
         diagnostics: list[str] = []
+        if hash_mismatches:
+            diagnostics.append(f"content_hash_mismatch:{hash_mismatches}")
         candidates: list[dict[str, Any]] = []
         signatures: dict[str, _Signature] = {}
         near_excluded = {
@@ -505,7 +583,7 @@ class MediaDuplicateAnalyzer(Analyzer):
                         "relation": relation,
                         "reason": reason,
                         "hamming_distance": distance,
-                        "score": round(1.0 - distance / 64.0, 4),
+                        "score": round(1.0 - distance / 63.0, 4),
                         "aspect_delta": round(aspect_delta, 4),
                         "duration_delta": round(duration_delta, 4),
                         "frame_count": [left.frame_count, right.frame_count],
@@ -525,14 +603,27 @@ class MediaDuplicateAnalyzer(Analyzer):
             if near_ready < len(occurrences) and near_detection == "enabled":
                 near_detection = "partial"
 
+        exact_clusters = [
+            cluster for cluster in clusters if cluster["relation"] == "exact_duplicate"
+        ]
+        template_clusters = [
+            cluster for cluster in clusters if cluster["relation"] == "same_meme_template"
+        ]
         coverage = {
             "top_level_messages": len(snapshot.messages),
             "media_refs_seen": total_refs,
             "eligible": eligible,
             "analyzed": len(occurrences),
             "unique_media_groups": len(groups),
-            "exact_clusters": len(clusters),
-            "exact_occurrences": sum(cluster["occurrence_count"] for cluster in clusters),
+            "exact_clusters": len(exact_clusters),
+            "template_clusters": len(template_clusters),
+            "exact_occurrences": sum(cluster["occurrence_count"] for cluster in exact_clusters),
+            "template_occurrences": sum(cluster["occurrence_count"] for cluster in template_clusters),
+            "confirmed_duplicate_occurrences": sum(
+                cluster["occurrence_count"] - 1 for cluster in exact_clusters
+            ),
+            "hash_mismatch": hash_mismatches,
+            "by_kind": by_kind,
             "excluded": excluded,
             "near_detection": near_detection,
             "near_eligible": near_ready,
@@ -552,7 +643,7 @@ class MediaDuplicateAnalyzer(Analyzer):
             "version": self.version,
             "config": {
                 "phash_threshold": config.phash_threshold,
-                "phash_algorithm": "phash64-dct-8x8",
+                "phash_algorithm": "phash63-dct-8x8-ac",
                 "caption_source": "message_text",
                 "near_detection": near_detection,
             },
