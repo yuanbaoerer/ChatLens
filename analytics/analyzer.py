@@ -364,9 +364,10 @@ class AnalyzerRegistry:
 def default_registry() -> AnalyzerRegistry:
     """Production registry: only implemented analyzers are registered.
 
-    CL-04 and later tasks add their analyzers here. Tests supply their own
+    CL-05 and later tasks add their analyzers here. Tests supply their own
     registry with synthetic analyzers.
     """
     from analytics.analyzers.media_duplicates import MediaDuplicateAnalyzer
+    from analytics.analyzers.text_links import TextLinkDuplicateAnalyzer
 
-    return AnalyzerRegistry((MediaDuplicateAnalyzer(),))
+    return AnalyzerRegistry((MediaDuplicateAnalyzer(), TextLinkDuplicateAnalyzer()))
