@@ -1,5 +1,32 @@
 """ChatLens cross-platform analytics core package."""
 from analytics.adapters import ChatSourceAdapter, JsonlExportAdapter, SqliteArchiveAdapter
+from analytics.analysis_service import (
+    AnalysisQueueFull,
+    AnalysisResultError,
+    AnalysisService,
+    AnalysisServiceClosed,
+)
+from analytics.analysis_store import (
+    RunManifest,
+    RunRecord,
+    RunStatus,
+    RunStore,
+    StageRecord,
+    StageSpec,
+    StageStatus,
+)
+from analytics.analyzer import (
+    AnalysisCancelled,
+    AnalysisContext,
+    AnalysisResult,
+    Analyzer,
+    AnalyzerRegistry,
+    AnalyzerRegistryError,
+    ArtifactRef,
+    Cancellation,
+    ProgressReporter,
+    default_registry,
+)
 from analytics.models import (
     CoverageSummary,
     ForwardChild,
@@ -23,6 +50,18 @@ from analytics.privacy import Pseudonymizer, resolve_safe_path
 from analytics.snapshot import SnapshotBuilder, make_stable_message_id
 
 __all__ = [
+    "AnalysisCancelled",
+    "AnalysisContext",
+    "AnalysisQueueFull",
+    "AnalysisResult",
+    "AnalysisResultError",
+    "AnalysisService",
+    "AnalysisServiceClosed",
+    "Analyzer",
+    "AnalyzerRegistry",
+    "AnalyzerRegistryError",
+    "ArtifactRef",
+    "Cancellation",
     "ChatSourceAdapter",
     "CoverageSummary",
     "ForwardChild",
@@ -38,13 +77,22 @@ __all__ = [
     "MessageCursor",
     "MessagePage",
     "ObservedSpan",
+    "ProgressReporter",
     "Pseudonymizer",
     "QuoteRef",
+    "RunManifest",
+    "RunRecord",
+    "RunStatus",
+    "RunStore",
     "Snapshot",
     "SnapshotBuilder",
     "SqliteArchiveAdapter",
+    "StageRecord",
+    "StageSpec",
+    "StageStatus",
     "TimeRange",
     "TypeCoverage",
+    "default_registry",
     "make_stable_message_id",
     "resolve_safe_path",
 ]
