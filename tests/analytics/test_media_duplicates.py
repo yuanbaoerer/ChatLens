@@ -470,6 +470,18 @@ class MediaDuplicateTests(unittest.TestCase):
         self.assertEqual(result.evidence_ids, ())
         self.assertEqual(result.output["coverage"]["excluded"]["invalid_hash"], 2)
 
+    def test_missing_hash_is_recomputed_from_media_root(self):
+        picture = image()
+        first_path = self.save_image("a.png", picture)
+        self.add_media("a.png", picture=picture, content_hash=None)
+        self.add_media("b.png", picture=picture, raw=first_path.read_bytes(), content_hash=None)
+
+        result = self.analyze(media_root=self.media_root)
+
+        self.assertEqual(len(result.output["clusters"]), 1)
+        self.assertEqual(result.output["coverage"]["analyzed"], 2)
+        self.assertEqual(result.output["coverage"]["excluded"]["invalid_hash"], 0)
+
     def test_exact_hash_uses_current_file_when_media_root_exists(self):
         base = image()
         variant = image(color="gold")
