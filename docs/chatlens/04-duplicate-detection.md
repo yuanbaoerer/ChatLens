@@ -9,3 +9,14 @@ L3: local text embedding Top-K retrieval, bounded candidates and time window con
 Relations: EXACT_DUPLICATE, NEAR_DUPLICATE, SEMANTIC_DUPLICATE, SAME_MEME_TEMPLATE, SAME_EVENT_WITH_UPDATE, CONTRADICTORY, UNRELATED, UNCERTAIN. Direction of new information matters: newer contains claims absent from older; same topic != same event. Preserve discussion context.
 
 Clusters: exact equivalence grouped by key; approximate semantic joins checked against representative and conflict/consistency rules; do not transitively merge similarity edges indiscriminately. Retain edges, rejected/uncertain candidates and counts. Test A~B~C bridge cases, URL variants, changed number/negation, crop/resize, GIF change and missing files.
+
+## CL-03 deterministic implementation (media only)
+
+`media.duplicates` v1 scans top-level messages and nested forward children:
+
+- Exact: readable, non-thumbnail image/emoji/sticker media grouped by SHA-256; only groups with at least two occurrences become `clusters`.
+- Near: configurable pHash (64-bit DCT, `phash_threshold` default 10), aspect checks, and GIF frame-count/sample-sequence/duration checks. Animated media is never compared by its first frame alone; static-vs-animated is excluded.
+- Captions: normalized message text (NFKC, whitespace, placeholder labels) distinguishes `near_duplicate` from `same_meme_template`. OCR is not part of CL-03; the output records `caption_source: "message_text"`.
+- Excluded: missing, unsupported, failed, not-requested, thumbnail, no-path, outside-root and unreadable assets are counted separately and never treated as unique or duplicate evidence.
+- Config: `media_root` (optional, required for near detection), `phash_threshold`, `max_candidate_pairs`, `max_near_groups`, `max_frames`.
+- Output: `coverage`, `clusters`, `candidates`, per-stage `evidence_ids`; near/template/uncertain candidates are not auto-merged into exact clusters.

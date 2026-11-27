@@ -16,6 +16,7 @@ from analytics.analysis_store import (
     StageSpec,
     StageStatus,
 )
+from analytics.analyzers import MediaDuplicateAnalyzer
 from analytics.analyzer import (
     AnalysisCancelled,
     AnalysisContext,
@@ -71,6 +72,7 @@ __all__ = [
     "JsonlExportAdapter",
     "LinkMeta",
     "LocalEvidenceLocator",
+    "MediaDuplicateAnalyzer",
     "MediaQuality",
     "MediaRef",
     "MediaRole",
