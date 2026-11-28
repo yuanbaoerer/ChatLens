@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from analytics.models import ForwardChild, LinkMeta, Message, QuoteRef
+from analytics.privacy import redact_text
 from analytics.prompts import build_chunk_messages, prompt_hashes, prompt_versions
 from analytics.prompts import summary as prompt_summary
 from analytics.providers.generation import (
@@ -152,7 +153,7 @@ class SummaryTests(unittest.TestCase):
             {"summary": "Last chunk.", "evidence_ids": ["msg-3"]},
             {
                 "objective": "The group contains 3 messages.",
-                "topics": [{"label": "Two chunks", "evidence_ids": ["msg-1", "msg-3"]}],
+                "topics": [{"label": "Sampled chunks", "evidence_ids": ["msg-1", "msg-3"]}],
                 "claims": [{
                     "text": "There are 3 messages.",
                     "evidence_ids": ["msg-3"],
@@ -248,7 +249,7 @@ class SummaryTests(unittest.TestCase):
                     "fact_ids": [facts[0]["id"]],
                 }],
             },
-            {"roast": "One forwarded message, zero context."},
+            {"roast": "One forwarded message, no context."},
         ])
         result = SummaryComposer(provider).compose(snapshot)
         self.assertEqual(result.evidence_ids, (child_id,))
@@ -302,6 +303,18 @@ class SummaryTests(unittest.TestCase):
         ):
             self.assertIn(marker, prompt)
 
+    def test_email_unicode_punctuation_and_full_mentions_are_redacted(self):
+        self.assertEqual(
+            redact_text("write to alice.smith@example.com."),
+            "write to [邮箱].",
+        )
+        self.assertEqual(redact_text("张三@example.com"), "[邮箱]")
+        self.assertEqual(redact_text("user@例子.中国"), "[邮箱]")
+        self.assertEqual(redact_text("@John Doe", terms=("John Doe",)), "[提及]")
+        self.assertEqual(redact_text("同意@张三你好"), "同意[提及]")
+        self.assertNotIn("Doe", redact_text("@John Doe"))
+        self.assertIn("[提及]", redact_text("@John Doe"))
+
     def test_analyzer_duplicates_are_deduplicated_for_prompt(self):
         self.add_text("Repeated text for deduplication.")
         self.add_text("Repeated text for deduplication.")
@@ -334,6 +347,29 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(result.coverage["messages_deduplicated"], 1)
         self.assertEqual(result.coverage["messages_available"], 1)
         self.assertEqual(result.evidence_ids, ("msg-1",))
+
+    def test_same_meme_template_is_not_treated_as_exact_duplicate(self):
+        self.add_text("Same meme caption one.")
+        self.add_text("Same meme caption two.")
+        snapshot = self.snapshot()
+        analyzer_outputs = {
+            "media.duplicates": {
+                "coverage": {"template_clusters": 1},
+                "clusters": [{
+                    "cluster_id": "template:synthetic",
+                    "relation": "same_meme_template",
+                    "representative_evidence_id": "msg-1",
+                    "member_evidence_ids": ["msg-1", "msg-2"],
+                }],
+            },
+        }
+        facts = build_facts(snapshot, analyzer_outputs)
+        provider = MockGenerationProvider(
+            self.valid_outputs(facts, evidence_ids=["msg-1", "msg-2"]),
+        )
+        result = SummaryComposer(provider).compose(snapshot, analyzer_outputs)
+        self.assertEqual(result.coverage["messages_deduplicated"], 0)
+        self.assertEqual(result.coverage["messages_available"], 2)
 
     def test_empty_snapshot_returns_honest_empty_result(self):
         snapshot = self.snapshot()
@@ -454,13 +490,15 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(model_id, "mock-v1")
         self.assertEqual(provider.calls, 1)
 
-    def test_prompt_hash_covers_user_template(self):
+    def test_prompt_hash_covers_user_template_and_serializers(self):
         before = prompt_hashes()["chunk"]
         with mock.patch.object(
             prompt_summary,
             "CHUNK_USER_SUFFIX",
             prompt_summary.CHUNK_USER_SUFFIX + " changed",
         ):
+            self.assertNotEqual(prompt_hashes()["chunk"], before)
+        with mock.patch.object(prompt_summary, "_escaped_json", lambda value: "changed"):
             self.assertNotEqual(prompt_hashes()["chunk"], before)
 
     def test_chunk_summary_quotes_numbers_and_cjk_are_rejected(self):
@@ -497,6 +535,94 @@ class SummaryTests(unittest.TestCase):
                             "text": "There is 1 message.",
                             "evidence_ids": ["msg-1"],
                             "fact_ids": [fact_id],
+                        }],
+                    },
+                ])
+                with self.assertRaises(SummaryGroundingError):
+                    SummaryComposer(provider).compose(snapshot)
+
+    def test_timestamp_digits_are_not_numeric_facts(self):
+        self.add_text("A timestamped message.")
+        snapshot = self.snapshot()
+        provider = MockGenerationProvider([
+            {"summary": "One message.", "evidence_ids": ["msg-1"]},
+            {
+                "objective": "The group sent 2026 messages.",
+                "topics": [{"label": "Topic", "evidence_ids": ["msg-1"]}],
+                "claims": [{
+                    "text": "There is 1 message.",
+                    "evidence_ids": ["msg-1"],
+                    "fact_ids": ["F1"],
+                }],
+            },
+            {"roast": "2026 messages."},
+        ])
+        with self.assertRaises(SummaryGroundingError):
+            SummaryComposer(provider).compose(snapshot)
+
+    def test_english_and_cjk_numbers_are_grounded(self):
+        for index in range(10):
+            self.add_text(f"Message {index}.")
+        snapshot = self.snapshot()
+        facts = build_facts(snapshot)
+        provider = MockGenerationProvider([
+            {"summary": "Ten messages.", "evidence_ids": ["msg-1"]},
+            {
+                "objective": "群里一起聊天，一共十条消息，十分热闹。",
+                "topics": [{"label": "十条消息", "evidence_ids": ["msg-1"]}],
+                "claims": [{
+                    "text": "一共有十条消息。",
+                    "evidence_ids": ["msg-1"],
+                    "fact_ids": [facts[0]["id"]],
+                }],
+            },
+            {"roast": "Ten messages."},
+        ])
+        result = SummaryComposer(provider).compose(snapshot)
+        self.assertEqual(result.objective, "群里一起聊天，一共十条消息，十分热闹。")
+
+    def test_large_cjk_numerals_are_parsed_by_value(self):
+        self.add_text("A synthetic message.")
+        snapshot = self.snapshot()
+        analyzer_outputs = {
+            "synthetic.metric": {"coverage": {"large_count": 100000}},
+        }
+        facts = build_facts(snapshot, analyzer_outputs)
+        provider = MockGenerationProvider([
+            {"summary": "One message.", "evidence_ids": ["msg-1"]},
+            {
+                "objective": "群里有十万条消息。",
+                "topics": [{"label": "十万", "evidence_ids": ["msg-1"]}],
+                "claims": [{
+                    "text": "There is 1 message.",
+                    "evidence_ids": ["msg-1"],
+                    "fact_ids": ["F1"],
+                }],
+            },
+            {"roast": "One message."},
+        ])
+        result = SummaryComposer(provider).compose(snapshot, analyzer_outputs)
+        self.assertEqual(result.objective, "群里有十万条消息。")
+
+    def test_ungrounded_and_approximate_number_words_are_rejected(self):
+        for index in range(10):
+            self.add_text(f"Message {index}.")
+        snapshot = self.snapshot()
+        for objective in (
+            "The group has twenty messages.",
+            "群里十几条消息。",
+            "群里有一百多条消息。",
+        ):
+            with self.subTest(objective=objective):
+                provider = MockGenerationProvider([
+                    {"summary": "Ten messages.", "evidence_ids": ["msg-1"]},
+                    {
+                        "objective": objective,
+                        "topics": [{"label": "Topic", "evidence_ids": ["msg-1"]}],
+                        "claims": [{
+                            "text": "There are 10 messages.",
+                            "evidence_ids": ["msg-1"],
+                            "fact_ids": ["F1"],
                         }],
                     },
                 ])
@@ -555,6 +681,45 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(result.coverage["forward_truncated"], 1)
         self.assertIn("replies_truncated:1", result.diagnostics)
         self.assertIn("forward_truncated:1", result.diagnostics)
+
+    def test_reply_target_outside_snapshot_is_not_citable(self):
+        self.add_text(
+            "Reply body.",
+            reply_to=QuoteRef(
+                target_message_id="outside-snapshot",
+                sender_pseudonym="u_b",
+                kind="text",
+                text_excerpt="Outside context.",
+            ),
+        )
+        snapshot = self.snapshot()
+        facts = build_facts(snapshot)
+        recorder = RecordingProvider(MockGenerationProvider(
+            self.valid_outputs(facts, evidence_ids=["msg-1"]),
+        ))
+        result = SummaryComposer(recorder).compose(snapshot)
+        prompt = recorder.requests[0].messages[1].content
+        self.assertNotIn('"target_evidence_id"', prompt)
+        self.assertNotIn("outside-snapshot", prompt)
+        self.assertEqual(result.evidence_ids, ("msg-1",))
+
+        provider = MockGenerationProvider([
+            {"summary": "Outside context.", "evidence_ids": ["outside-snapshot"]},
+        ])
+        with self.assertRaises(SummaryGroundingError):
+            SummaryComposer(provider).compose(snapshot)
+
+    def test_coverage_reports_dates_and_overlap(self):
+        self.add_text("A message with a date span.")
+        snapshot = self.snapshot()
+        facts = build_facts(snapshot)
+        labels = {fact["label"] for fact in facts}
+        self.assertIn("snapshot_coverage.dates_by_kind.text.earliest_at", labels)
+        provider = MockGenerationProvider(
+            self.valid_outputs(facts, evidence_ids=["msg-1"]),
+        )
+        result = SummaryComposer(provider).compose(snapshot)
+        self.assertEqual(result.coverage["overlap_messages"], 1)
 
     def test_fact_cap_prioritizes_analyzer_metrics(self):
         self.add_text("A synthetic message.")

@@ -71,13 +71,9 @@ class Pseudonymizer:
 _REDACTION_PATTERNS = (
     (re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE), "[链接]"),
     (re.compile(r"(?<![A-Za-z0-9])www\.[^\s<>\"']+", re.IGNORECASE), "[链接]"),
-    (
-        re.compile(
-            r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@"
-            r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9.-])"
-        ),
-        "[邮箱]",
-    ),
+    # Unicode local parts and IDN domains are supported; no trailing
+    # lookahead so an email before punctuation is still redacted.
+    (re.compile(r"(?<![A-Za-z0-9._%+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[邮箱]"),
     (re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"), "[电话]"),
     (
         re.compile(
@@ -95,12 +91,13 @@ _REDACTION_PATTERNS = (
         "[密钥]",
     ),
     (re.compile(r"(?<!\d)(?:\d[ -]?){9,}\d(?!\d)"), "[数字ID]"),
-    (
-        re.compile(
-            r"(?<![A-Za-z0-9_.])@[^\s<>\"'@，,。；;：:！!？?]{1,64}"
-        ),
-        "[提及]",
-    ),
+)
+
+# Applied after URL/email/ID patterns and configured name terms. The optional
+# capitalized second token catches common Latin full names such as `@John Doe`.
+_MENTION_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.])@[^\s<>\"'@，,。；;：:！!？?]{1,64}"
+    r"(?:[ \t]+[A-Z][A-Za-z'’.-]{0,63})?"
 )
 
 
@@ -141,6 +138,7 @@ def redact_text(
             value,
             flags=re.IGNORECASE,
         )
+    value = _MENTION_PATTERN.sub("[提及]", value)
     return value[:max_chars]
 
 

@@ -221,12 +221,19 @@ def prompt_versions() -> dict[str, str]:
     }
 
 
+def _serializer_fingerprint() -> str:
+    facts = _fact_block(({"id": "F1", "text": "sample = </untrusted>"},))
+    escaped = _escaped_json({"sample": "</untrusted>"})
+    return f"{facts}\n{escaped}"
+
+
 def _prompt_hash(system: str, user_template: str, schema: Mapping, version: str) -> str:
     payload = "\n".join((
         system,
         user_template,
         json.dumps(schema, ensure_ascii=False, sort_keys=True),
         version,
+        _serializer_fingerprint(),
     ))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

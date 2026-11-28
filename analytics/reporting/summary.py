@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Any
 
@@ -29,16 +31,109 @@ from analytics.providers.generation import (
     estimate_tokens,
 )
 
-_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
-_CJK_NUMBER_RE = re.compile(
-    r"[零〇一二两三四五六七八九十百千万亿]+"
-    r"(?=(?:次|条|个|人|天|年|月|日|周|小时|分钟|秒|张|段|句|页))"
-)
+_ARABIC_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _QUOTE_RE = re.compile(
     r"[\"“”「」『』‘’《》〈〉]"
     r"|(?<![A-Za-z0-9])'[^'\n]{1,200}'(?![A-Za-z0-9])"
 )
 _MAX_FACTS = 80
+
+_EN_NUMBER_UNITS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+}
+_EN_NUMBER_TENS = {
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+_EN_NUMBER_SCALES = {
+    "hundred": 100,
+    "thousand": 1_000,
+    "million": 1_000_000,
+    "billion": 1_000_000_000,
+    "trillion": 1_000_000_000_000,
+}
+_EN_NUMBER_APPROX = {
+    "dozen": 12,
+    "dozens": 12,
+    "hundreds": 100,
+    "thousands": 1_000,
+    "millions": 1_000_000,
+    "billions": 1_000_000_000,
+}
+_EN_NUMBER_WORD = "|".join(
+    sorted(
+        {
+            *_EN_NUMBER_UNITS,
+            *_EN_NUMBER_TENS,
+            *_EN_NUMBER_SCALES,
+            *_EN_NUMBER_APPROX,
+        },
+        key=len,
+        reverse=True,
+    )
+)
+_EN_NUMBER_RE = re.compile(
+    rf"(?<![A-Za-z])(?:{_EN_NUMBER_WORD})"
+    rf"(?:(?:[-\s]+(?:and[-\s]+)?)(?:{_EN_NUMBER_WORD}))*(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_EN_NUMBER_SEPARATOR_RE = re.compile(r"[-\s]+")
+
+_CJK_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CJK_UNITS = {
+    "十": 10,
+    "百": 100,
+    "千": 1_000,
+    "万": 10_000,
+    "亿": 100_000_000,
+}
+_CJK_NUMBER_RE = re.compile(r"[零〇一二两三四五六七八九十百千万亿]+")
+_CJK_APPROX_SUFFIXES = ("几", "多", "余", "左右", "上下", "来")
+_CJK_APPROX_PREFIXES = ("数", "约", "近", "超过", "不足")
+_CJK_NON_NUMERIC_RE = re.compile(
+    r"一起|一共|一定|一般|一些|一直|一致|一切|一旦|一样|一边|一面|"
+    r"一方面|一下|一会儿|一点|一心|一味|一概|一律|一贯|一连|一并|"
+    r"一同|一向|一时|一经|一手|一体|一如|一番|万一|统一|唯一|"
+    r"百分之|千分之|万分之|十分(?!钟)"
+)
 
 
 class SummaryError(RuntimeError):
@@ -216,6 +311,16 @@ def build_facts(
         snapshot_coverage.get("media_by_kind", {}),
         entries,
     )
+    _flatten_facts(
+        "snapshot_coverage.dates_by_kind",
+        snapshot_coverage.get("dates_by_kind", {}),
+        entries,
+    )
+    _flatten_facts(
+        "snapshot_coverage.media_dates_by_kind",
+        snapshot_coverage.get("media_dates_by_kind", {}),
+        entries,
+    )
 
     omitted = max(0, len(entries) - _MAX_FACTS)
     facts: list[dict[str, Any]] = []
@@ -236,20 +341,94 @@ def build_facts(
     return tuple(facts)
 
 
-def _allowed_numbers(facts: Sequence[Mapping[str, Any]]) -> set[str]:
-    allowed: set[str] = set()
+def _allowed_numbers(facts: Sequence[Mapping[str, Any]]) -> set[Decimal]:
+    """Return numeric fact values, never digits embedded in dates or labels."""
+    allowed: set[Decimal] = set()
     for fact in facts:
-        allowed.update(_NUMBER_RE.findall(str(fact["text"])))
+        value = fact.get("value")
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            allowed.add(Decimal(value))
+        elif isinstance(value, float) and math.isfinite(value):
+            allowed.add(Decimal(str(value)))
     return allowed
 
 
-def _assert_numbers(text: str, allowed: set[str], field_name: str) -> None:
+def _parse_english_number(value: str) -> tuple[Decimal, bool]:
+    words = [
+        word
+        for word in _EN_NUMBER_SEPARATOR_RE.split(value.lower())
+        if word and word != "and"
+    ]
+    total = 0
+    current = 0
+    approximate = False
+    for word in words:
+        if word in _EN_NUMBER_UNITS:
+            current += _EN_NUMBER_UNITS[word]
+        elif word in _EN_NUMBER_TENS:
+            current += _EN_NUMBER_TENS[word]
+        elif word in _EN_NUMBER_SCALES:
+            scale = _EN_NUMBER_SCALES[word]
+            if scale >= 1_000:
+                total += max(current, 1) * scale
+                current = 0
+            else:
+                current = max(current, 1) * scale
+        elif word in _EN_NUMBER_APPROX:
+            approximate = True
+            scale = _EN_NUMBER_APPROX[word]
+            if scale >= 1_000:
+                total += max(current, 1) * scale
+                current = 0
+            else:
+                current = max(current, 1) * scale
+    return Decimal(total + current), approximate
+
+
+def _parse_cjk_number(value: str) -> Decimal:
+    total = 0
+    section = 0
+    number = 0
+    for char in value:
+        if char in _CJK_DIGITS:
+            number = _CJK_DIGITS[char]
+        elif char in _CJK_UNITS:
+            unit = _CJK_UNITS[char]
+            if unit >= 10_000:
+                section += number
+                total += (section or 1) * unit
+                section = 0
+                number = 0
+            else:
+                section += (number or 1) * unit
+                number = 0
+    return Decimal(total + section + number)
+
+
+def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
+    mentions: list[tuple[Decimal, bool]] = []
+    for match in _ARABIC_NUMBER_RE.finditer(text):
+        mentions.append((Decimal(match.group()), False))
+    for match in _EN_NUMBER_RE.finditer(text):
+        mentions.append(_parse_english_number(match.group()))
+    masked = _CJK_NON_NUMERIC_RE.sub(lambda match: " " * len(match.group()), text)
+    for match in _CJK_NUMBER_RE.finditer(masked):
+        tail = text[match.end():match.end() + 2]
+        prefix = text[:match.start()]
+        approximate = tail.startswith(_CJK_APPROX_SUFFIXES) or any(
+            prefix.endswith(value) for value in _CJK_APPROX_PREFIXES
+        )
+        mentions.append((_parse_cjk_number(match.group()), approximate))
+    return mentions
+
+
+def _assert_numbers(text: str, allowed: set[Decimal], field_name: str) -> None:
     if _QUOTE_RE.search(text):
         raise SummaryGroundingError(f"{field_name} contains a quote; CL-06 does not support quotes")
-    if _CJK_NUMBER_RE.search(text):
-        raise SummaryGroundingError(f"{field_name} contains an unsupported number")
-    for token in _NUMBER_RE.findall(text):
-        if token not in allowed:
+    for value, approximate in _number_mentions(text):
+        if approximate or value not in allowed:
             raise SummaryGroundingError(f"{field_name} contains an unsupported number")
 
 
@@ -458,6 +637,9 @@ class SummaryComposer:
                 for cluster in clusters:
                     if not isinstance(cluster, Mapping):
                         continue
+                    relation = cluster.get("relation")
+                    if relation not in (None, "exact_duplicate"):
+                        continue
                     representative = cluster.get("representative_evidence_id")
                     members = cluster.get("member_evidence_ids", [])
                     if not isinstance(members, list):
@@ -477,6 +659,16 @@ class SummaryComposer:
             "forward_truncated": 0,
             "replies_truncated": 0,
         }
+        known_evidence = {message.message_id for message in snapshot.messages}
+        pending = [
+            child
+            for message in snapshot.messages
+            for child in message.forward_children
+        ]
+        while pending:
+            child = pending.pop()
+            known_evidence.add(child.child_id)
+            pending.extend(child.forward_children)
 
         def render_text(text: str) -> tuple[str, bool]:
             rendered = redact_text(
@@ -496,7 +688,7 @@ class SummaryComposer:
                 "kind": reply.kind,
                 "text": text,
             }
-            if reply.target_message_id:
+            if reply.target_message_id in known_evidence:
                 payload["target_evidence_id"] = reply.target_message_id
             if truncated:
                 payload["truncated"] = True
@@ -652,6 +844,7 @@ class SummaryComposer:
             "chunks_available": len(available_chunks),
             "chunks_processed": len(chunks),
             "chunks_truncated": len(chunks) < len(available_chunks),
+            "overlap_messages": self.config.overlap_messages,
             "max_chunks": self.config.max_chunks,
             "max_chunk_tokens": self.config.max_chunk_tokens,
         }
@@ -663,7 +856,7 @@ class SummaryComposer:
         allowed_evidence: set[str],
         facts: Sequence[Mapping[str, Any]],
     ) -> None:
-        fact_text = {str(fact["id"]): str(fact["text"]) for fact in facts}
+        fact_by_id = {str(fact["id"]): fact for fact in facts}
         allowed_numbers = _allowed_numbers(facts)
         _assert_numbers(fact_sheet["objective"], allowed_numbers, "objective")
         for topic in fact_sheet["topics"]:
@@ -673,11 +866,9 @@ class SummaryComposer:
             _validate_evidence(claim.get("evidence_ids"), allowed_evidence, "claim evidence")
             fact_ids = claim.get("fact_ids")
             if not isinstance(fact_ids, list) or not fact_ids or any(
-                not isinstance(fact_id, str) or fact_id not in fact_text
+                not isinstance(fact_id, str) or fact_id not in fact_by_id
                 for fact_id in fact_ids
             ):
                 raise SummaryGroundingError("claim contains an unknown fact ID")
-            claim_numbers: set[str] = set()
-            for fact_id in fact_ids:
-                claim_numbers.update(_NUMBER_RE.findall(fact_text[fact_id]))
+            claim_numbers = _allowed_numbers([fact_by_id[fact_id] for fact_id in fact_ids])
             _assert_numbers(claim["text"], claim_numbers, "claim text")
