@@ -35,9 +35,9 @@ _ARABIC_NUMBER_RE = re.compile(
     r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 )
 _QUOTE_RE = re.compile(
-    r"[\"“”「」『』«»‚‛]"
+    r"[\"“”「」『』«»‚‛＂‹›〝〞﹁﹂﹃﹄]"
     r"|(?<![A-Za-z0-9])'(?!n['’]|em['’]|til['’]|cause['’])"
-    r"(?:[^'\n]|'(?=[A-Za-z])){1,200}'(?![A-Za-z0-9])"
+    r"(?:[^'\n]|'(?=[A-Za-z])){1,200}['’](?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])‘[^'\n]{1,200}’(?![A-Za-z0-9])"
     r"|`[^`\n]{1,200}`"
 )
@@ -144,7 +144,8 @@ _CJK_MEASURES = (
     "段", "句", "页", "篇", "份", "群", "批", "套", "岁", "元", "块", "斤",
     "公里", "米", "克", "分", "倍", "成", "种", "类", "项", "级", "折", "层",
     "届", "期", "轮", "场", "遍", "趟", "声", "步", "杯", "本", "只", "件", "台",
-    "辆", "家", "所", "间",
+    "辆", "家", "所", "间", "幅", "则", "封", "笔", "枚", "座", "支", "根", "颗",
+    "粒", "片",
 )
 _CJK_NUMERIC_PREFIXES = (
     "共", "有", "达", "为", "是", "到", "超", "约", "近", "大约", "至少", "最多",
@@ -167,7 +168,7 @@ _ARABIC_DATE_MASK_RE = re.compile(
     r")"
 )
 _ARABIC_SCALE_RE = re.compile(
-    r"-?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)([千万亿])"
+    r"-?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)([千万亿]+)"
 )
 _ARABIC_SCALE_VALUES = {"千": 1_000, "万": 10_000, "亿": 100_000_000}
 
@@ -183,14 +184,15 @@ _NUMBER_APPROX_PREFIXES = (
 )
 _NUMBER_APPROX_SUFFIXES = (
     "多", "余", "几", "左右", "上下", "以上", "以下", "以内", "出头", "开外",
-    "不到", "or so", "plus", "ish", "-ish", "+",
+    "不到", "or so", "plus", "-plus", "ish", "-ish", "something",
+    "-something", "+",
 )
 _CJK_NON_NUMERIC_RE = re.compile(
     r"一起|一共|一定|一般|一些|一直|一致|一切|一旦|一样|一边|一面|"
     r"一方面|一下|一会儿|一点|一心|一味|一概|一律|一贯|一连|一并|"
     r"一同|一向|一时|一经|一手|一体|一如|一番|万一|统一|唯一|"
     r"百分之|百分比|千分之|万分之|十分(?!钟)|进一步|第一|三明治|千万不要|"
-    r"千万别|千万不能"
+    r"千万别|千万不能|一本正经|一声不吭|一步到位"
 )
 
 
@@ -522,7 +524,10 @@ def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
     )
     for match in _ARABIC_SCALE_RE.finditer(arabic_masked):
         raw = match.group()
-        value = Decimal(raw[:-1].replace(",", "")) * _ARABIC_SCALE_VALUES[raw[-1]]
+        scale = match.group(1)
+        value = Decimal(raw[:-len(scale)].replace(",", ""))
+        for char in scale:
+            value *= _ARABIC_SCALE_VALUES[char]
         mentions.append((
             value,
             _has_approx_context(text, match.start(), match.end()),
@@ -574,7 +579,7 @@ def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
 
 def _date_variants(token: str) -> set[str]:
     variants = {token}
-    iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?", token)
+    iso = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T ].*)?", token)
     cjk = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})[日号]", token)
     month_day = re.fullmatch(r"(\d{1,2})月(\d{1,2})[日号]", token)
     year_month = re.fullmatch(r"(\d{4})年(\d{1,2})月", token)
@@ -602,19 +607,19 @@ def _date_variants(token: str) -> set[str]:
         return variants
     month_num = int(month_value) if month_value else None
     day_num = int(day_value) if day_value else None
-    if year_value and month_num and day_num:
-        variants.update({
-            f"{year_value}-{month_num:02d}-{day_num:02d}",
-            f"{year_value}年{month_num}月{day_num}日",
-            f"{year_value}年{month_num}月{day_num}号",
-            f"{year_value}年{month_num}月",
-            f"{year_value}年",
-        })
     if month_num and day_num:
         variants.update({f"{month_num}月{day_num}日", f"{month_num}月{day_num}号"})
-    if month_num:
+        if year_value:
+            variants.update({
+                f"{year_value}-{month_num:02d}-{day_num:02d}",
+                f"{year_value}年{month_num}月{day_num}日",
+                f"{year_value}年{month_num}月{day_num}号",
+            })
+    elif year_value and month_num:
+        variants.add(f"{year_value}年{month_num}月")
+    elif month_num:
         variants.add(f"{month_num}月")
-    if year_value:
+    elif year_value:
         variants.add(f"{year_value}年")
     return variants
 

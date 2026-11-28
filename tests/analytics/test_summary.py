@@ -278,7 +278,7 @@ class SummaryTests(unittest.TestCase):
             SummaryConfig(redact_terms=("Alice",)),
         ).compose(snapshot)
 
-        self.assertEqual(result.coverage["redaction"], "regex-v4")
+        self.assertEqual(result.coverage["redaction"], "regex-v5")
         prompt = recorder.requests[0].messages[1].content
         for secret in (
             "a@example.com",
@@ -327,6 +327,8 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(redact_text("@Alice123"), "[提及]")
         self.assertEqual(redact_text("@Alice_2"), "[提及]")
         self.assertEqual(redact_text("＠张三"), "[提及]")
+        self.assertEqual(redact_text("abc@张三"), "abc[提及]")
+        self.assertEqual(redact_text("abc＠张三"), "abc[提及]")
         self.assertEqual(redact_text("@John Doe", terms=("John Doe",)), "[提及]")
         self.assertEqual(redact_text("同意@张三你好"), "同意[提及]")
         self.assertEqual(redact_text("ghp_12345678"), "[密钥]")
@@ -576,6 +578,7 @@ class SummaryTests(unittest.TestCase):
         for approximate in (
             "约300", "300多", "10几", "about 300", "几十", "上百", "两三百", "三十以内",
             "300+", "30不到", "少于300", "大概300", "三分之一",
+            "30-plus", "thirty-something",
         ):
             with self.subTest(approximate=approximate):
                 mentions = _number_mentions(approximate)
@@ -587,7 +590,8 @@ class SummaryTests(unittest.TestCase):
             ("晚上三十条消息", 30), ("2026 messages", 2026),
             ("百分之五十", 50), ("百分之百", 100),
             ("说了三遍", 3), ("走了一趟", 1), ("喝了两杯", 2),
-            ("300万条", 3_000_000), ("1.5万", 15_000),
+            ("300万条", 3_000_000), ("1.5万", 15_000), ("3千万", 30_000_000),
+            ("1千万", 10_000_000), ("说了两幅图", 2), ("五封消息", 5),
         ):
             with self.subTest(exact=exact):
                 self.assertEqual(_number_mentions(exact), [(Decimal(value), False)])
@@ -597,7 +601,7 @@ class SummaryTests(unittest.TestCase):
         ):
             with self.subTest(masked=masked):
                 self.assertEqual(_number_mentions(masked), [])
-        for lexical in ("进一步", "第一", "三明治", "千万不要", "no one"):
+        for lexical in ("进一步", "第一", "三明治", "千万不要", "no one", "一本正经", "一声不吭", "一步到位"):
             with self.subTest(lexical=lexical):
                 self.assertEqual(_number_mentions(lexical), [])
 
@@ -624,6 +628,8 @@ class SummaryTests(unittest.TestCase):
         }])
         _assert_numbers("2026-01-02", set(), "test", allowed_dates=allowed)
         _assert_numbers("2026年1月2日", set(), "test", allowed_dates=allowed)
+        with self.assertRaises(SummaryGroundingError):
+            _assert_numbers("2026年12月31日", set(), "test", allowed_dates=allowed)
 
     def test_timestamp_digits_are_not_numeric_facts(self):
         self.add_text("A timestamped message.")
