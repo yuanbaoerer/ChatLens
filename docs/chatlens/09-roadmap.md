@@ -12,7 +12,8 @@ Each task uses focused PR, tests, evidence, no auto-merge. Dependencies are logi
 | CL-03 | Image/GIF/sticker detection merged in [PR #5](https://github.com/yuanbaoerer/ChatLens/pull/5) (`8a676a5`). | 76 Analytics tests and 8 Moect baseline tests passed in WSL with Python 3.11 before merge. Windows native workspace-lock, WebView2 demo and WeChat integration checks remain pending. |
 | CL-04 | Text/link/forward detection merged in [PR #6](https://github.com/yuanbaoerer/ChatLens/pull/6) (`8a1ef62`). | 93 Analytics tests and 8 Moect baseline tests passed in WSL with Python 3.11 before merge. Windows native workspace-lock, WebView2 demo and WeChat integration checks remain pending. |
 | CL-05 | Generation provider merged in [PR #7](https://github.com/yuanbaoerer/ChatLens/pull/7) (`2167242`). | 116 Analytics tests and 8 Moect baseline tests passed in WSL with Python 3.11 before merge. Windows native workspace-lock, WebView2 demo and WeChat integration checks remain pending. |
-| CL-06 | Next implementation task. | Planned scope is objective/roast summary with chunk+reduce, grounded facts and injection tests. |
+| CL-06 | Objective/roast summary merged in [PR #8](https://github.com/yuanbaoerer/ChatLens/pull/8) (`1bb11df`). | 149 Analytics tests (including 33 CL-06 summary tests) and 8 Moect baseline tests passed in WSL with Python 3.11 before merge. Windows native workspace-lock, WebView2 demo and WeChat integration checks remain pending. |
+| CL-07 | Next implementation task. | Planned scope is bounded embedding retrieval with recall measurement and a local baseline. |
 
 ## Task roadmap
 
