@@ -7,7 +7,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path, PureWindowsPath
 
-REDACTION_VERSION = "regex-v3"
+REDACTION_VERSION = "regex-v4"
 
 
 class Pseudonymizer:
@@ -103,9 +103,9 @@ _REDACTION_PATTERNS = (
 # capitalized second token catches common Latin full names such as `@John Doe`.
 _MENTION_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_.])@(?:"
-    r"[A-Z][A-Za-z'’.-]{0,63}(?:[ \t]+[A-Z][A-Za-z'’.-]{0,63})?"
+    r"[A-Za-z0-9_][A-Za-z0-9_'’.-]{0,63}"
     r"|[^\s<>\"'@，,。；;：:！!？?]{1,64}"
-    r")"
+    r")(?:[ \t]+[A-Za-z][A-Za-z0-9_'’.-]{0,63})?"
 )
 
 

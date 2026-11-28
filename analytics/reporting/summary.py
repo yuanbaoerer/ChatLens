@@ -36,7 +36,9 @@ _ARABIC_NUMBER_RE = re.compile(
 )
 _QUOTE_RE = re.compile(
     r"[\"“”「」『』]"
-    r"|(?<![A-Za-z0-9])['‘][^'\n‘’]{1,200}['’](?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])'(?!n['’]|em['’]|til['’]|cause['’])"
+    r"[^'\n‘’]{1,200}['’](?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])‘[^'\n]{1,200}’(?![A-Za-z0-9])"
 )
 _MAX_FACTS = 80
 
@@ -132,12 +134,14 @@ _CJK_APPROX_SUFFIXES = (
     "几", "多", "余", "左右", "上下", "来", "以上", "以下", "以内", "出头", "开外",
 )
 _CJK_APPROX_PREFIXES = (
-    "几", "数", "约", "近", "大约", "超过", "不足", "不到", "至少", "最多", "上",
+    "几", "数", "约", "近", "大约", "超过", "不足", "不到", "至少", "最多",
+    "少于", "低于", "多于", "高于", "大概", "差不多",
 )
 _CJK_MEASURES = (
     "次", "条", "个", "人", "天", "年", "日", "周", "小时", "分钟", "秒", "张",
     "段", "句", "页", "篇", "份", "群", "批", "套", "岁", "元", "块", "斤",
-    "公里", "米", "克", "分",
+    "公里", "米", "克", "分", "倍", "成", "种", "类", "项", "级", "折", "层",
+    "届", "期", "轮", "场",
 )
 _CJK_NUMERIC_PREFIXES = (
     "共", "有", "达", "为", "是", "到", "超", "约", "近", "大约", "至少", "最多",
@@ -149,8 +153,16 @@ _CJK_DATE_MASK_RE = re.compile(
     r"[零〇一二两三四五六七八九十百千万亿]+(?:月|日|号)"
 )
 _ARABIC_DATE_MASK_RE = re.compile(
-    r"(?<!\d)(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年|"
-    r"\d{1,2}月\d{1,2}日|\d{1,2}月|\d{1,2}日|\d{1,2}:\d{2})(?!\d)"
+    r"(?<!\d)(?:"
+    r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
+    r"(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?"
+    r"|\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?"
+    r"|\d{1,2}月\d{1,2}日"
+    r"|\d{1,2}月"
+    r"|\d{1,2}日"
+    r"|\d{1,2}点(?:钟)?"
+    r"|\d{1,2}:\d{2}(?::\d{2})?"
+    r")"
 )
 _EN_NON_NUMERIC_RE = re.compile(
     r"\bno one\b|\bone of\b|\bone another\b|\bone's\b",
@@ -158,18 +170,19 @@ _EN_NON_NUMERIC_RE = re.compile(
 )
 _NUMBER_APPROX_PREFIXES = (
     "about", "around", "roughly", "approximately", "nearly", "over", "under",
-    "more than", "less than", "at least", "at most", "约", "大约", "近", "接近",
-    "超过", "不足", "不到", "至少", "最多",
+    "more than", "less than", "at least", "at most", "fewer than", "up to",
+    "no more than", "no less than", "约", "大约", "近", "接近", "超过", "不足",
+    "不到", "至少", "最多", "少于", "低于", "多于", "高于", "大概", "差不多",
 )
 _NUMBER_APPROX_SUFFIXES = (
     "多", "余", "几", "左右", "上下", "以上", "以下", "以内", "出头", "开外",
-    "or so", "plus", "ish",
+    "不到", "or so", "plus", "ish", "-ish", "+",
 )
 _CJK_NON_NUMERIC_RE = re.compile(
     r"一起|一共|一定|一般|一些|一直|一致|一切|一旦|一样|一边|一面|"
     r"一方面|一下|一会儿|一点|一心|一味|一概|一律|一贯|一连|一并|"
     r"一同|一向|一时|一经|一手|一体|一如|一番|万一|统一|唯一|"
-    r"百分之|千分之|万分之|十分(?!钟)|进一步|第一|三明治|千万不要|"
+    r"百分之|百分比|千分之|万分之|十分(?!钟)|进一步|第一|三明治|千万不要|"
     r"千万别|千万不能"
 )
 
@@ -445,13 +458,25 @@ def _parse_cjk_number(value: str) -> Decimal:
     return Decimal(total + section + number)
 
 
-def _has_approx_context(text: str, start: int, end: int) -> bool:
+def _has_approx_context(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    include_cjk_prefixes: bool = False,
+) -> bool:
     prefix = text[:start].lower().rstrip()
     suffix = text[end:].lower().lstrip()
-    for marker in (*_NUMBER_APPROX_PREFIXES, *_CJK_APPROX_PREFIXES):
+    prefixes = _NUMBER_APPROX_PREFIXES
+    if include_cjk_prefixes:
+        prefixes = (*prefixes, *_CJK_APPROX_PREFIXES)
+    for marker in prefixes:
         if marker == "近" and prefix.endswith("最近"):
             continue
-        if prefix.endswith(marker):
+        if marker.isascii() and any(char.isalpha() for char in marker):
+            if re.search(rf"(?<![A-Za-z]){re.escape(marker)}$", prefix):
+                return True
+        elif prefix.endswith(marker):
             return True
     for marker in (*_NUMBER_APPROX_SUFFIXES, *_CJK_APPROX_SUFFIXES):
         if suffix.startswith(marker):
@@ -468,6 +493,8 @@ def _cjk_value_is_approx(value: str) -> bool:
 def _cjk_is_contextual(text: str, start: int, end: int) -> bool:
     prefix = text[:start].rstrip()
     tail = text[end:]
+    if prefix.endswith("第"):
+        return False
     if tail.startswith(_CJK_MEASURES):
         return True
     if any(prefix.endswith(marker) for marker in _CJK_NUMERIC_PREFIXES):
@@ -508,17 +535,46 @@ def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
     for match in _CJK_NUMBER_RE.finditer(cjk_masked):
         value = match.group()
         approximate = _cjk_value_is_approx(value) or _has_approx_context(
-            text, match.start(), match.end()
+            text,
+            match.start(),
+            match.end(),
+            include_cjk_prefixes=True,
         )
+        prefix = text[:match.start()].rstrip()
+        if not approximate and prefix.endswith("上") and value[0] in "百千万亿":
+            approximate = True
         if not approximate and not _cjk_is_contextual(text, match.start(), match.end()):
             continue
         mentions.append((_parse_cjk_number(value), approximate))
     return mentions
 
 
-def _assert_numbers(text: str, allowed: set[Decimal], field_name: str) -> None:
+def _allowed_dates(facts: Sequence[Mapping[str, Any]]) -> set[str]:
+    dates: set[str] = set()
+    for fact in facts:
+        for value in (fact.get("value"), fact.get("text")):
+            if not isinstance(value, str):
+                continue
+            for pattern in (_ARABIC_DATE_MASK_RE, _CJK_DATE_MASK_RE):
+                dates.update(match.group() for match in pattern.finditer(value))
+    return dates
+
+
+def _assert_numbers(
+    text: str,
+    allowed: set[Decimal],
+    field_name: str,
+    allowed_dates: set[str] | None = None,
+) -> None:
     if _QUOTE_RE.search(text):
         raise SummaryGroundingError(f"{field_name} contains a quote; CL-06 does not support quotes")
+    if allowed_dates is not None:
+        for pattern in (_ARABIC_DATE_MASK_RE, _CJK_DATE_MASK_RE):
+            for match in pattern.finditer(text):
+                if match.group() not in allowed_dates:
+                    raise SummaryGroundingError(
+                        f"{field_name} contains an ungrounded date or time"
+                    )
     for value, approximate in _number_mentions(text):
         if approximate or value not in allowed:
             raise SummaryGroundingError(f"{field_name} contains an unsupported number")
@@ -558,6 +614,7 @@ class SummaryComposer:
     ) -> SummaryResult:
         facts = build_facts(snapshot, analyzer_outputs)
         allowed_numbers = _allowed_numbers(facts)
+        allowed_dates = _allowed_dates(facts)
         items, payload_coverage = self._collect_items(snapshot)
         duplicate_ids = self._duplicate_evidence_ids(analyzer_outputs)
         kept_items = [
@@ -567,6 +624,15 @@ class SummaryComposer:
         deduplicated = len(items) - len(kept_items)
         items = kept_items
         if not items:
+            fact_truncated = next(
+                (fact["value"] for fact in facts if fact["label"] == "facts_truncated"),
+                0,
+            )
+            diagnostics = [
+                "empty_snapshot" if not snapshot.messages else "no_summary_content",
+            ]
+            if fact_truncated:
+                diagnostics.append(f"facts_truncated:{fact_truncated}")
             return SummaryResult(
                 objective="所选时间范围内没有可分析的消息。",
                 roast="",
@@ -589,9 +655,7 @@ class SummaryComposer:
                     "provider_calls": 0,
                 },
                 usage=TokenUsage(),
-                diagnostics=(
-                    "empty_snapshot" if not snapshot.messages else "no_summary_content",
-                ),
+                diagnostics=tuple(diagnostics),
                 prompt_versions=prompt_versions(),
                 prompt_hashes=prompt_hashes(),
             )
@@ -615,7 +679,12 @@ class SummaryComposer:
             model_ids.append(response.model_id)
             allowed_evidence = self._chunk_evidence_ids(chunk)
             _validate_evidence(response.output.get("evidence_ids"), allowed_evidence, "chunk evidence")
-            _assert_numbers(response.output["summary"], allowed_numbers, f"chunk {index} summary")
+            _assert_numbers(
+                response.output["summary"],
+                allowed_numbers,
+                f"chunk {index} summary",
+                allowed_dates=allowed_dates,
+            )
             summarized_evidence.update(response.output["evidence_ids"])
             chunk_summaries.append({
                 "summary": response.output["summary"],
@@ -715,7 +784,12 @@ class SummaryComposer:
             metadata={"stage": "style", "prompt_version": prompt_versions()["style"]},
         ), cancellation)
         roast = response.output["roast"]
-        _assert_numbers(roast, _allowed_numbers(facts), "roast")
+        _assert_numbers(
+            roast,
+            _allowed_numbers(facts),
+            "roast",
+            allowed_dates=_allowed_dates(facts),
+        )
         return roast, response.usage, response.model_id
 
     @staticmethod
@@ -951,10 +1025,21 @@ class SummaryComposer:
     ) -> None:
         fact_by_id = {str(fact["id"]): fact for fact in facts}
         allowed_numbers = _allowed_numbers(facts)
-        _assert_numbers(fact_sheet["objective"], allowed_numbers, "objective")
+        allowed_dates = _allowed_dates(facts)
+        _assert_numbers(
+            fact_sheet["objective"],
+            allowed_numbers,
+            "objective",
+            allowed_dates=allowed_dates,
+        )
         for topic in fact_sheet["topics"]:
             _validate_evidence(topic.get("evidence_ids"), allowed_evidence, "topic evidence")
-            _assert_numbers(topic["label"], allowed_numbers, "topic label")
+            _assert_numbers(
+                topic["label"],
+                allowed_numbers,
+                "topic label",
+                allowed_dates=allowed_dates,
+            )
         for claim in fact_sheet["claims"]:
             _validate_evidence(claim.get("evidence_ids"), allowed_evidence, "claim evidence")
             fact_ids = claim.get("fact_ids")
@@ -964,4 +1049,11 @@ class SummaryComposer:
             ):
                 raise SummaryGroundingError("claim contains an unknown fact ID")
             claim_numbers = _allowed_numbers([fact_by_id[fact_id] for fact_id in fact_ids])
-            _assert_numbers(claim["text"], claim_numbers, "claim text")
+            _assert_numbers(
+                claim["text"],
+                claim_numbers,
+                "claim text",
+                allowed_dates=_allowed_dates(
+                    [fact_by_id[fact_id] for fact_id in fact_ids]
+                ),
+            )
