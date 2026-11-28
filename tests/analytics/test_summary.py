@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest import mock
 
 from analytics.models import ForwardChild, LinkMeta, Message, QuoteRef
@@ -20,6 +21,8 @@ from analytics.reporting.summary import (
     SummaryConfig,
     SummaryGroundingError,
     SummaryInputError,
+    _assert_numbers,
+    _number_mentions,
     build_facts,
 )
 from analytics.snapshot import SnapshotBuilder
@@ -180,13 +183,14 @@ class SummaryTests(unittest.TestCase):
             self.add_text(f"Message {index} with enough text to be summarized.")
         snapshot = self.snapshot()
         facts = build_facts(snapshot)
-        outputs = self.valid_outputs(facts, evidence_ids=["msg-1"])
+        outputs = self.valid_outputs(facts, evidence_ids=["msg-3"])
         provider = MockGenerationProvider(outputs)
         result = SummaryComposer(
             provider,
             SummaryConfig(max_chunks=1, max_messages_per_chunk=1, overlap_messages=0),
         ).compose(snapshot)
 
+        self.assertEqual(result.evidence_ids, ("msg-3",))
         self.assertEqual(result.coverage["messages_available"], 5)
         self.assertEqual(result.coverage["messages_included"], 1)
         self.assertEqual(result.coverage["messages_truncated"], 4)
@@ -268,11 +272,12 @@ class SummaryTests(unittest.TestCase):
         recorder = RecordingProvider(MockGenerationProvider(
             self.valid_outputs(facts, evidence_ids=["msg-1"]),
         ))
-        SummaryComposer(
+        result = SummaryComposer(
             recorder,
             SummaryConfig(redact_terms=("Alice",)),
         ).compose(snapshot)
 
+        self.assertEqual(result.coverage["redaction"], "regex-v3")
         prompt = recorder.requests[0].messages[1].content
         for secret in (
             "a@example.com",
@@ -310,6 +315,11 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertEqual(redact_text("张三@example.com"), "[邮箱]")
         self.assertEqual(redact_text("user@例子.中国"), "[邮箱]")
+        self.assertEqual(
+            redact_text("请把资料发到邮箱abc@qq.com"),
+            "请把资料发到邮箱[邮箱]",
+        )
+        self.assertEqual(redact_text("@alice Thanks"), "[提及] Thanks")
         self.assertEqual(redact_text("@John Doe", terms=("John Doe",)), "[提及]")
         self.assertEqual(redact_text("同意@张三你好"), "同意[提及]")
         self.assertNotIn("Doe", redact_text("@John Doe"))
@@ -324,6 +334,7 @@ class SummaryTests(unittest.TestCase):
                 "coverage": {"text_clusters": 1},
                 "clusters": [{
                     "cluster_id": "text:synthetic",
+                    "relation": "exact_duplicate",
                     "representative_evidence_id": "msg-1",
                     "member_evidence_ids": ["msg-1", "msg-2"],
                 }],
@@ -381,6 +392,14 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(result.evidence_ids, ())
         self.assertEqual(result.coverage["messages_available"], 0)
         self.assertIn("empty_snapshot", result.diagnostics)
+        self.assertEqual(provider.calls, 0)
+
+    def test_nonempty_snapshot_without_content_is_distinguished(self):
+        self.add_text("")
+        snapshot = self.snapshot()
+        provider = MockGenerationProvider([])
+        result = SummaryComposer(provider).compose(snapshot)
+        self.assertIn("no_summary_content", result.diagnostics)
         self.assertEqual(provider.calls, 0)
 
     def test_analyzer_facts_are_included(self):
@@ -540,6 +559,30 @@ class SummaryTests(unittest.TestCase):
                 ])
                 with self.assertRaises(SummaryGroundingError):
                     SummaryComposer(provider).compose(snapshot)
+
+    def test_number_parser_guards_grouping_approximation_and_lexical_words(self):
+        self.assertEqual(
+            _number_mentions("1,000 messages"),
+            [(Decimal(1000), False)],
+        )
+        for approximate in (
+            "约300", "300多", "10几", "about 300", "几十", "上百", "两三百", "三十以内",
+        ):
+            with self.subTest(approximate=approximate):
+                self.assertTrue(all(flag for _, flag in _number_mentions(approximate)))
+        self.assertEqual(_number_mentions("最近三十条"), [(Decimal(30), False)])
+        self.assertEqual(_number_mentions("十二月"), [])
+        self.assertEqual(_number_mentions("2026-01-02"), [])
+        self.assertEqual(_number_mentions("2026 messages"), [(Decimal(2026), False)])
+        for lexical in ("进一步", "第一", "三明治", "千万不要", "no one"):
+            with self.subTest(lexical=lexical):
+                self.assertEqual(_number_mentions(lexical), [])
+
+        _assert_numbers("don’t", set(), "test")
+        _assert_numbers("group’s", set(), "test")
+        _assert_numbers("《红楼梦》", set(), "test")
+        with self.assertRaises(SummaryGroundingError):
+            _assert_numbers("‘hello’", set(), "test")
 
     def test_timestamp_digits_are_not_numeric_facts(self):
         self.add_text("A timestamped message.")

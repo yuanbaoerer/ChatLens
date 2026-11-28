@@ -7,7 +7,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path, PureWindowsPath
 
-REDACTION_VERSION = "regex-v2"
+REDACTION_VERSION = "regex-v3"
 
 
 class Pseudonymizer:
@@ -71,8 +71,14 @@ class Pseudonymizer:
 _REDACTION_PATTERNS = (
     (re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE), "[链接]"),
     (re.compile(r"(?<![A-Za-z0-9])www\.[^\s<>\"']+", re.IGNORECASE), "[链接]"),
-    # Unicode local parts and IDN domains are supported; no trailing
-    # lookahead so an email before punctuation is still redacted.
+    # ASCII local parts are handled first so Chinese prose before an ASCII
+    # address is preserved. Unicode local parts and IDN domains are fallback.
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[\w-]+(?:\.[\w-]+)+"
+        ),
+        "[邮箱]",
+    ),
     (re.compile(r"(?<![A-Za-z0-9._%+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[邮箱]"),
     (re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"), "[电话]"),
     (
@@ -96,8 +102,10 @@ _REDACTION_PATTERNS = (
 # Applied after URL/email/ID patterns and configured name terms. The optional
 # capitalized second token catches common Latin full names such as `@John Doe`.
 _MENTION_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_.])@[^\s<>\"'@，,。；;：:！!？?]{1,64}"
-    r"(?:[ \t]+[A-Z][A-Za-z'’.-]{0,63})?"
+    r"(?<![A-Za-z0-9_.])@(?:"
+    r"[A-Z][A-Za-z'’.-]{0,63}(?:[ \t]+[A-Z][A-Za-z'’.-]{0,63})?"
+    r"|[^\s<>\"'@，,。；;：:！!？?]{1,64}"
+    r")"
 )
 
 
@@ -107,13 +115,13 @@ def redact_text(
     max_chars: int = 500,
     terms: Sequence[str] = (),
 ) -> str:
-    """Minimize free text before provider calls without normalizing its meaning.
+    """Minimize free text before provider calls, failing closed at boundaries.
 
     URLs, emails, phone numbers, WeChat/secret-like identifiers, @mentions and
     long digit sequences are replaced. Optional caller-authorized member names
-    are replaced next, before the result is bounded. Whitespace is collapsed.
-    Callers must not treat redaction as a substitute for consent or retention
-    controls.
+    are replaced next, before the result is bounded. Redaction fails closed and
+    may remove adjacent context when a boundary is ambiguous; callers must not
+    treat it as a substitute for consent or retention controls.
     """
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")

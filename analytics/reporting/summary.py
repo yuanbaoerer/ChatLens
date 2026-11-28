@@ -31,10 +31,12 @@ from analytics.providers.generation import (
     estimate_tokens,
 )
 
-_ARABIC_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_ARABIC_NUMBER_RE = re.compile(
+    r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+)
 _QUOTE_RE = re.compile(
-    r"[\"“”「」『』‘’《》〈〉]"
-    r"|(?<![A-Za-z0-9])'[^'\n]{1,200}'(?![A-Za-z0-9])"
+    r"[\"“”「」『』]"
+    r"|(?<![A-Za-z0-9])['‘][^'\n‘’]{1,200}['’](?![A-Za-z0-9])"
 )
 _MAX_FACTS = 80
 
@@ -126,13 +128,49 @@ _CJK_UNITS = {
     "亿": 100_000_000,
 }
 _CJK_NUMBER_RE = re.compile(r"[零〇一二两三四五六七八九十百千万亿]+")
-_CJK_APPROX_SUFFIXES = ("几", "多", "余", "左右", "上下", "来")
-_CJK_APPROX_PREFIXES = ("数", "约", "近", "超过", "不足")
+_CJK_APPROX_SUFFIXES = (
+    "几", "多", "余", "左右", "上下", "来", "以上", "以下", "以内", "出头", "开外",
+)
+_CJK_APPROX_PREFIXES = (
+    "几", "数", "约", "近", "大约", "超过", "不足", "不到", "至少", "最多", "上",
+)
+_CJK_MEASURES = (
+    "次", "条", "个", "人", "天", "年", "日", "周", "小时", "分钟", "秒", "张",
+    "段", "句", "页", "篇", "份", "群", "批", "套", "岁", "元", "块", "斤",
+    "公里", "米", "克", "分",
+)
+_CJK_NUMERIC_PREFIXES = (
+    "共", "有", "达", "为", "是", "到", "超", "约", "近", "大约", "至少", "最多",
+    "不足", "不到", "超过", "剩余", "总共", "一共", "合计", "计", "仅", "只",
+    "已", "至", "前",
+)
+_CJK_DATE_MASK_RE = re.compile(
+    r"[零〇一二三四五六七八九]{4}年|"
+    r"[零〇一二两三四五六七八九十百千万亿]+(?:月|日|号)"
+)
+_ARABIC_DATE_MASK_RE = re.compile(
+    r"(?<!\d)(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年|"
+    r"\d{1,2}月\d{1,2}日|\d{1,2}月|\d{1,2}日|\d{1,2}:\d{2})(?!\d)"
+)
+_EN_NON_NUMERIC_RE = re.compile(
+    r"\bno one\b|\bone of\b|\bone another\b|\bone's\b",
+    re.IGNORECASE,
+)
+_NUMBER_APPROX_PREFIXES = (
+    "about", "around", "roughly", "approximately", "nearly", "over", "under",
+    "more than", "less than", "at least", "at most", "约", "大约", "近", "接近",
+    "超过", "不足", "不到", "至少", "最多",
+)
+_NUMBER_APPROX_SUFFIXES = (
+    "多", "余", "几", "左右", "上下", "以上", "以下", "以内", "出头", "开外",
+    "or so", "plus", "ish",
+)
 _CJK_NON_NUMERIC_RE = re.compile(
     r"一起|一共|一定|一般|一些|一直|一致|一切|一旦|一样|一边|一面|"
     r"一方面|一下|一会儿|一点|一心|一味|一概|一律|一贯|一连|一并|"
     r"一同|一向|一时|一经|一手|一体|一如|一番|万一|统一|唯一|"
-    r"百分之|千分之|万分之|十分(?!钟)"
+    r"百分之|千分之|万分之|十分(?!钟)|进一步|第一|三明治|千万不要|"
+    r"千万别|千万不能"
 )
 
 
@@ -407,20 +445,74 @@ def _parse_cjk_number(value: str) -> Decimal:
     return Decimal(total + section + number)
 
 
+def _has_approx_context(text: str, start: int, end: int) -> bool:
+    prefix = text[:start].lower().rstrip()
+    suffix = text[end:].lower().lstrip()
+    for marker in (*_NUMBER_APPROX_PREFIXES, *_CJK_APPROX_PREFIXES):
+        if marker == "近" and prefix.endswith("最近"):
+            continue
+        if prefix.endswith(marker):
+            return True
+    for marker in (*_NUMBER_APPROX_SUFFIXES, *_CJK_APPROX_SUFFIXES):
+        if suffix.startswith(marker):
+            return True
+    return False
+
+
+def _cjk_value_is_approx(value: str) -> bool:
+    if re.search(r"[零〇一二两三四五六七八九]{2,}[百千万亿]", value):
+        return True
+    return len(value) > 1 and not any(unit in value for unit in _CJK_UNITS)
+
+
+def _cjk_is_contextual(text: str, start: int, end: int) -> bool:
+    prefix = text[:start].rstrip()
+    tail = text[end:]
+    if tail.startswith(_CJK_MEASURES):
+        return True
+    if any(prefix.endswith(marker) for marker in _CJK_NUMERIC_PREFIXES):
+        return True
+    stripped_tail = tail.lstrip()
+    return not prefix and (
+        not stripped_tail or stripped_tail[0] in "，,。；;：:！!？?、\n"
+    )
+
+
 def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
     mentions: list[tuple[Decimal, bool]] = []
-    for match in _ARABIC_NUMBER_RE.finditer(text):
-        mentions.append((Decimal(match.group()), False))
-    for match in _EN_NUMBER_RE.finditer(text):
-        mentions.append(_parse_english_number(match.group()))
-    masked = _CJK_NON_NUMERIC_RE.sub(lambda match: " " * len(match.group()), text)
-    for match in _CJK_NUMBER_RE.finditer(masked):
-        tail = text[match.end():match.end() + 2]
-        prefix = text[:match.start()]
-        approximate = tail.startswith(_CJK_APPROX_SUFFIXES) or any(
-            prefix.endswith(value) for value in _CJK_APPROX_PREFIXES
+    arabic_masked = _ARABIC_DATE_MASK_RE.sub(
+        lambda match: " " * len(match.group()), text
+    )
+    for match in _ARABIC_NUMBER_RE.finditer(arabic_masked):
+        mentions.append((
+            Decimal(match.group().replace(",", "")),
+            _has_approx_context(text, match.start(), match.end()),
+        ))
+
+    english_masked = _EN_NON_NUMERIC_RE.sub(
+        lambda match: " " * len(match.group()), text
+    )
+    for match in _EN_NUMBER_RE.finditer(english_masked):
+        value, approximate = _parse_english_number(match.group())
+        mentions.append((
+            value,
+            approximate or _has_approx_context(text, match.start(), match.end()),
+        ))
+
+    cjk_masked = _CJK_NON_NUMERIC_RE.sub(
+        lambda match: " " * len(match.group()), text
+    )
+    cjk_masked = _CJK_DATE_MASK_RE.sub(
+        lambda match: " " * len(match.group()), cjk_masked
+    )
+    for match in _CJK_NUMBER_RE.finditer(cjk_masked):
+        value = match.group()
+        approximate = _cjk_value_is_approx(value) or _has_approx_context(
+            text, match.start(), match.end()
         )
-        mentions.append((_parse_cjk_number(match.group()), approximate))
+        if not approximate and not _cjk_is_contextual(text, match.start(), match.end()):
+            continue
+        mentions.append((_parse_cjk_number(value), approximate))
     return mentions
 
 
@@ -497,7 +589,9 @@ class SummaryComposer:
                     "provider_calls": 0,
                 },
                 usage=TokenUsage(),
-                diagnostics=("empty_snapshot",),
+                diagnostics=(
+                    "empty_snapshot" if not snapshot.messages else "no_summary_content",
+                ),
                 prompt_versions=prompt_versions(),
                 prompt_hashes=prompt_hashes(),
             )
@@ -637,8 +731,7 @@ class SummaryComposer:
                 for cluster in clusters:
                     if not isinstance(cluster, Mapping):
                         continue
-                    relation = cluster.get("relation")
-                    if relation not in (None, "exact_duplicate"):
+                    if cluster.get("relation") != "exact_duplicate":
                         continue
                     representative = cluster.get("representative_evidence_id")
                     members = cluster.get("member_evidence_ids", [])
@@ -824,7 +917,7 @@ class SummaryComposer:
         if len(available_chunks) <= self.config.max_chunks:
             chunks = available_chunks
         elif self.config.max_chunks == 1:
-            chunks = [available_chunks[0]]
+            chunks = [available_chunks[len(available_chunks) // 2]]
         else:
             # Sample evenly across the full time span instead of always taking
             # an earliest-message prefix; the first/last chunks stay visible.
