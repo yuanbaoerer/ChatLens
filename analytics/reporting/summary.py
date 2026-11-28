@@ -35,10 +35,11 @@ _ARABIC_NUMBER_RE = re.compile(
     r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 )
 _QUOTE_RE = re.compile(
-    r"[\"“”「」『』]"
+    r"[\"“”「」『』«»‚‛]"
     r"|(?<![A-Za-z0-9])'(?!n['’]|em['’]|til['’]|cause['’])"
-    r"[^'\n‘’]{1,200}['’](?![A-Za-z0-9])"
+    r"(?:[^'\n]|'(?=[A-Za-z])){1,200}'(?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])‘[^'\n]{1,200}’(?![A-Za-z0-9])"
+    r"|`[^`\n]{1,200}`"
 )
 _MAX_FACTS = 80
 
@@ -130,6 +131,7 @@ _CJK_UNITS = {
     "亿": 100_000_000,
 }
 _CJK_NUMBER_RE = re.compile(r"[零〇一二两三四五六七八九十百千万亿]+")
+_CJK_FRACTION_RE = re.compile(r"[零〇一二两三四五六七八九十百千万亿]+分之[零〇一二两三四五六七八九十百千万亿]+")
 _CJK_APPROX_SUFFIXES = (
     "几", "多", "余", "左右", "上下", "来", "以上", "以下", "以内", "出头", "开外",
 )
@@ -141,7 +143,8 @@ _CJK_MEASURES = (
     "次", "条", "个", "人", "天", "年", "日", "周", "小时", "分钟", "秒", "张",
     "段", "句", "页", "篇", "份", "群", "批", "套", "岁", "元", "块", "斤",
     "公里", "米", "克", "分", "倍", "成", "种", "类", "项", "级", "折", "层",
-    "届", "期", "轮", "场",
+    "届", "期", "轮", "场", "遍", "趟", "声", "步", "杯", "本", "只", "件", "台",
+    "辆", "家", "所", "间",
 )
 _CJK_NUMERIC_PREFIXES = (
     "共", "有", "达", "为", "是", "到", "超", "约", "近", "大约", "至少", "最多",
@@ -156,14 +159,18 @@ _ARABIC_DATE_MASK_RE = re.compile(
     r"(?<!\d)(?:"
     r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
     r"(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?"
-    r"|\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?"
-    r"|\d{1,2}月\d{1,2}日"
+    r"|\d{4}年(?:\d{1,2}月)?(?:\d{1,2}[日号])?"
+    r"|\d{1,2}月\d{1,2}[日号]"
     r"|\d{1,2}月"
-    r"|\d{1,2}日"
-    r"|\d{1,2}点(?:钟)?"
+    r"|\d{1,2}点(?:\d{1,2}分|钟|半|整|(?=[，,。；;：:！!？?、\n]|$))"
     r"|\d{1,2}:\d{2}(?::\d{2})?"
     r")"
 )
+_ARABIC_SCALE_RE = re.compile(
+    r"-?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)([千万亿])"
+)
+_ARABIC_SCALE_VALUES = {"千": 1_000, "万": 10_000, "亿": 100_000_000}
+
 _EN_NON_NUMERIC_RE = re.compile(
     r"\bno one\b|\bone of\b|\bone another\b|\bone's\b",
     re.IGNORECASE,
@@ -507,8 +514,21 @@ def _cjk_is_contextual(text: str, start: int, end: int) -> bool:
 
 def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
     mentions: list[tuple[Decimal, bool]] = []
+    for match in _CJK_FRACTION_RE.finditer(text):
+        if not match.group().startswith("百分之"):
+            mentions.append((Decimal(0), True))
     arabic_masked = _ARABIC_DATE_MASK_RE.sub(
         lambda match: " " * len(match.group()), text
+    )
+    for match in _ARABIC_SCALE_RE.finditer(arabic_masked):
+        raw = match.group()
+        value = Decimal(raw[:-1].replace(",", "")) * _ARABIC_SCALE_VALUES[raw[-1]]
+        mentions.append((
+            value,
+            _has_approx_context(text, match.start(), match.end()),
+        ))
+    arabic_masked = _ARABIC_SCALE_RE.sub(
+        lambda match: " " * len(match.group()), arabic_masked
     )
     for match in _ARABIC_NUMBER_RE.finditer(arabic_masked):
         mentions.append((
@@ -532,6 +552,9 @@ def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
     cjk_masked = _CJK_DATE_MASK_RE.sub(
         lambda match: " " * len(match.group()), cjk_masked
     )
+    cjk_masked = _ARABIC_SCALE_RE.sub(
+        lambda match: " " * len(match.group()), cjk_masked
+    )
     for match in _CJK_NUMBER_RE.finditer(cjk_masked):
         value = match.group()
         approximate = _cjk_value_is_approx(value) or _has_approx_context(
@@ -543,10 +566,57 @@ def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
         prefix = text[:match.start()].rstrip()
         if not approximate and prefix.endswith("上") and value[0] in "百千万亿":
             approximate = True
-        if not approximate and not _cjk_is_contextual(text, match.start(), match.end()):
+        if not approximate and not _cjk_is_contextual(cjk_masked, match.start(), match.end()):
             continue
         mentions.append((_parse_cjk_number(value), approximate))
     return mentions
+
+
+def _date_variants(token: str) -> set[str]:
+    variants = {token}
+    iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?", token)
+    cjk = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})[日号]", token)
+    month_day = re.fullmatch(r"(\d{1,2})月(\d{1,2})[日号]", token)
+    year_month = re.fullmatch(r"(\d{4})年(\d{1,2})月", token)
+    month = re.fullmatch(r"(\d{1,2})月", token)
+    year = re.fullmatch(r"(\d{4})年", token)
+    if iso:
+        year_value, month_value, day_value = iso.groups()
+    elif cjk:
+        year_value, month_value, day_value = cjk.groups()
+    elif month_day:
+        year_value = None
+        month_value, day_value = month_day.groups()
+    elif year_month:
+        year_value, month_value = year_month.groups()
+        day_value = None
+    elif month:
+        year_value = None
+        month_value = month.group(1)
+        day_value = None
+    elif year:
+        year_value = year.group(1)
+        month_value = None
+        day_value = None
+    else:
+        return variants
+    month_num = int(month_value) if month_value else None
+    day_num = int(day_value) if day_value else None
+    if year_value and month_num and day_num:
+        variants.update({
+            f"{year_value}-{month_num:02d}-{day_num:02d}",
+            f"{year_value}年{month_num}月{day_num}日",
+            f"{year_value}年{month_num}月{day_num}号",
+            f"{year_value}年{month_num}月",
+            f"{year_value}年",
+        })
+    if month_num and day_num:
+        variants.update({f"{month_num}月{day_num}日", f"{month_num}月{day_num}号"})
+    if month_num:
+        variants.add(f"{month_num}月")
+    if year_value:
+        variants.add(f"{year_value}年")
+    return variants
 
 
 def _allowed_dates(facts: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -556,7 +626,8 @@ def _allowed_dates(facts: Sequence[Mapping[str, Any]]) -> set[str]:
             if not isinstance(value, str):
                 continue
             for pattern in (_ARABIC_DATE_MASK_RE, _CJK_DATE_MASK_RE):
-                dates.update(match.group() for match in pattern.finditer(value))
+                for match in pattern.finditer(value):
+                    dates.update(_date_variants(match.group()))
     return dates
 
 
@@ -571,7 +642,7 @@ def _assert_numbers(
     if allowed_dates is not None:
         for pattern in (_ARABIC_DATE_MASK_RE, _CJK_DATE_MASK_RE):
             for match in pattern.finditer(text):
-                if match.group() not in allowed_dates:
+                if not (_date_variants(match.group()) & allowed_dates):
                     raise SummaryGroundingError(
                         f"{field_name} contains an ungrounded date or time"
                     )

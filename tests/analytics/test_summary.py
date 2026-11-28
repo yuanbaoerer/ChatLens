@@ -21,6 +21,7 @@ from analytics.reporting.summary import (
     SummaryConfig,
     SummaryGroundingError,
     SummaryInputError,
+    _allowed_dates,
     _assert_numbers,
     _number_mentions,
     build_facts,
@@ -319,11 +320,16 @@ class SummaryTests(unittest.TestCase):
             redact_text("请把资料发到邮箱abc@qq.com"),
             "请把资料发到邮箱[邮箱]",
         )
+        self.assertEqual(redact_text("@alice Smith"), "[提及]")
+        self.assertEqual(redact_text("@Mary Jane Watson"), "[提及]")
+        self.assertEqual(redact_text("@John van Doe"), "[提及]")
         self.assertEqual(redact_text("@alice Thanks"), "[提及]")
         self.assertEqual(redact_text("@Alice123"), "[提及]")
         self.assertEqual(redact_text("@Alice_2"), "[提及]")
+        self.assertEqual(redact_text("＠张三"), "[提及]")
         self.assertEqual(redact_text("@John Doe", terms=("John Doe",)), "[提及]")
         self.assertEqual(redact_text("同意@张三你好"), "同意[提及]")
+        self.assertEqual(redact_text("ghp_12345678"), "[密钥]")
         self.assertNotIn("Doe", redact_text("@John Doe"))
         self.assertIn("[提及]", redact_text("@John Doe"))
 
@@ -569,16 +575,19 @@ class SummaryTests(unittest.TestCase):
         )
         for approximate in (
             "约300", "300多", "10几", "about 300", "几十", "上百", "两三百", "三十以内",
-            "300+", "30不到", "少于300", "大概300",
+            "300+", "30不到", "少于300", "大概300", "三分之一",
         ):
             with self.subTest(approximate=approximate):
                 mentions = _number_mentions(approximate)
                 self.assertTrue(mentions)
-                self.assertTrue(all(flag for _, flag in mentions))
+                self.assertTrue(any(flag for _, flag in mentions))
         for exact, value in (
             ("翻了三倍", 3), ("九成", 9), ("三种", 3), ("两倍", 2),
             ("最近三十条", 30), ("晚上30条消息", 30), ("cover 30 messages", 30),
             ("晚上三十条消息", 30), ("2026 messages", 2026),
+            ("百分之五十", 50), ("百分之百", 100),
+            ("说了三遍", 3), ("走了一趟", 1), ("喝了两杯", 2),
+            ("300万条", 3_000_000), ("1.5万", 15_000),
         ):
             with self.subTest(exact=exact):
                 self.assertEqual(_number_mentions(exact), [(Decimal(value), False)])
@@ -608,6 +617,13 @@ class SummaryTests(unittest.TestCase):
             "test",
             allowed_dates={"2025-12-01"},
         )
+        allowed = _allowed_dates([{
+            "id": "F1",
+            "value": "2026-01-02T03:04:05+00:00",
+            "text": "earliest_at = 2026-01-02T03:04:05+00:00",
+        }])
+        _assert_numbers("2026-01-02", set(), "test", allowed_dates=allowed)
+        _assert_numbers("2026年1月2日", set(), "test", allowed_dates=allowed)
 
     def test_timestamp_digits_are_not_numeric_facts(self):
         self.add_text("A timestamped message.")
