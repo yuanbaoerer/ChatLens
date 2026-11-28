@@ -345,9 +345,12 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(redact_text("abc＠张三"), "abc[提及]")
         self.assertEqual(redact_text("电话 1234567"), "[电话]")
         self.assertEqual(redact_text("tel:+1 (555) 123-4567"), "[电话]")
+        self.assertEqual(redact_text("电话（12345678）"), "[电话]")
+        self.assertEqual(redact_text("QQ(123456789)"), "[QQ]")
         self.assertEqual(redact_text("QQ号：123456789"), "[QQ]")
         self.assertEqual(redact_text("mp.weixin.qq.com/s/x"), "[链接]")
         self.assertEqual(redact_text("bit.ly/x"), "[链接]")
+        self.assertEqual(redact_text("example.com:8080/reset?token=x"), "[链接]")
         self.assertEqual(redact_text("@John Doe", terms=("John Doe",)), "[提及]")
         self.assertEqual(redact_text("同意@张三你好"), "同意[提及]")
         self.assertEqual(redact_text("ghp_12345678"), "[密钥]")
@@ -613,7 +616,7 @@ class SummaryTests(unittest.TestCase):
             ("300万条", 3_000_000), ("1.5万", 15_000), ("3千万", 30_000_000),
             ("1千万", 10_000_000), ("说了两幅图", 2), ("五封消息", 5),
             ("五波消息", 5), ("四组", 4), ("3百条", 300), ("1百", 100),
-            ("五位成员", 5), ("三名成员", 3),
+            ("五位成员", 5), ("三名成员", 3), ("一部电影", 1),
         ):
             with self.subTest(exact=exact):
                 self.assertEqual(_number_mentions(exact), [(Decimal(value), False)])
@@ -625,7 +628,8 @@ class SummaryTests(unittest.TestCase):
                 self.assertEqual(_number_mentions(masked), [])
         for lexical in (
             "进一步", "第一", "三明治", "千万不要", "no one", "一本正经",
-            "一声不吭", "一步到位", "一片混乱", "一根筋",
+            "一声不吭", "一步到位", "一片混乱", "一根筋", "一部分成员",
+            "一部份成员",
         ):
             with self.subTest(lexical=lexical):
                 self.assertEqual(_number_mentions(lexical), [])
