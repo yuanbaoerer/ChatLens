@@ -49,6 +49,18 @@ from analytics.models import (
     TypeCoverage,
 )
 from analytics.privacy import Pseudonymizer, resolve_safe_path
+from analytics.providers import (
+    GenerationBudget,
+    GenerationError,
+    GenerationMessage,
+    GenerationProvider,
+    GenerationRequest,
+    GenerationRequestError,
+    GenerationResponse,
+    MockGenerationProvider,
+    OpenAICompatibleGenerationProvider,
+    TokenUsage,
+)
 from analytics.snapshot import SnapshotBuilder, make_stable_message_id
 
 __all__ = [
@@ -68,6 +80,13 @@ __all__ = [
     "ChatSourceAdapter",
     "CoverageSummary",
     "ForwardChild",
+    "GenerationBudget",
+    "GenerationError",
+    "GenerationMessage",
+    "GenerationProvider",
+    "GenerationRequest",
+    "GenerationRequestError",
+    "GenerationResponse",
     "GroupInfo",
     "JsonlExportAdapter",
     "LinkMeta",
@@ -80,7 +99,9 @@ __all__ = [
     "Message",
     "MessageCursor",
     "MessagePage",
+    "MockGenerationProvider",
     "ObservedSpan",
+    "OpenAICompatibleGenerationProvider",
     "ProgressReporter",
     "Pseudonymizer",
     "QuoteRef",
@@ -96,6 +117,7 @@ __all__ = [
     "StageStatus",
     "TextLinkDuplicateAnalyzer",
     "TimeRange",
+    "TokenUsage",
     "TypeCoverage",
     "default_registry",
     "make_stable_message_id",
