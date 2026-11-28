@@ -167,10 +167,13 @@ _ARABIC_DATE_MASK_RE = re.compile(
     r"|\d{1,2}月\d{1,2}[日号]"
     r"|\d{1,2}月"
     r"|\d{1,2}点(?:\d{1,2}分|钟|半|整|(?=[，,。；;：:！!？?、\n]|$))"
-    r"|\d{1,2}:\d{2}(?::\d{2})?"
+    r"|\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}(?::?\d{2})?)?"
     r")"
 )
-_DECADE_RE = re.compile(r"(?<!\d)'?\d{2}s\b", re.IGNORECASE)
+_DECADE_RE = re.compile(
+    r"(?<!\d)'?\d{2}s(?![A-Za-z0-9])|\b\d{4}s(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 _ARABIC_SCALE_RE = re.compile(
     r"-?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)([百千万亿]+)"
 )
@@ -611,7 +614,7 @@ def _time_components(token: str) -> tuple[int, int, int | None, int | None] | No
     if match is None:
         return None
     seconds = int(match.group(3)) if match.group(3) is not None else None
-    offset_match = re.search(r"(Z|[+-]\d{2}:?\d{2})$", token)
+    offset_match = re.search(r"(Z|[+-]\d{2}(?::?\d{2})?)$", token)
     offset: int | None = None
     if offset_match:
         raw = offset_match.group(1)
@@ -620,7 +623,9 @@ def _time_components(token: str) -> tuple[int, int, int | None, int | None] | No
         else:
             sign = 1 if raw[0] == "+" else -1
             digits = raw[1:].replace(":", "")
-            offset = sign * (int(digits[:2]) * 60 + int(digits[2:]))
+            hours = int(digits[:2])
+            minutes = int(digits[2:]) if len(digits) > 2 else 0
+            offset = sign * (hours * 60 + minutes)
     return int(match.group(1)), int(match.group(2)), seconds, offset
 
 

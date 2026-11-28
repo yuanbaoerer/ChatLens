@@ -83,13 +83,14 @@ _REDACTION_PATTERNS = (
     (
         re.compile(
             r"(?<![A-Za-z0-9@])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}"
-            r"(?::\d{1,5})?(?:[/?][^\s<>\"']*)?"
+            r"(?::\d{1,5})?(?:[/?#][^\s<>\"']*)?"
         ),
         "[链接]",
     ),
     (
         re.compile(
-            r"(?:电话|手机|tel|phone)(?:号|号码)?\s*(?:是|为)?\s*[:：]?\s*"
+            r"(?:电话|手机|tel|phone)\s*(?:号|号码|number)?\s*"
+            r"(?:是|为)?\s*[:：]?\s*"
             r"[（(]?\s*\+?\d[\d ()-]{5,18}\d\s*[）)]?(?!\d)",
             re.IGNORECASE,
         ),
@@ -97,7 +98,7 @@ _REDACTION_PATTERNS = (
     ),
     (
         re.compile(
-            r"(?:QQ|qq)(?:号|号码)?\s*(?:是|为)?\s*[:：]?\s*"
+            r"(?:QQ|qq)\s*(?:号|号码|number)?\s*(?:是|为)?\s*[:：]?\s*"
             r"[（(]?\s*\d{5,15}\s*[）)]?(?!\d)"
         ),
         "[QQ]",
@@ -112,8 +113,8 @@ _REDACTION_PATTERNS = (
     ),
     (
         re.compile(
-            r"(?:微信号|微信|vx|weixin)\s*(?:是|为)?\s*[:：]?\s*"
-            r"[A-Za-z][A-Za-z0-9_-]{5,}",
+            r"(?:微信号|微信|vx|weixin)\s*(?:号|ID|id)?\s*(?:是|为)?\s*"
+            r"[:：]?\s*[A-Za-z][A-Za-z0-9_-]{5,}",
             re.IGNORECASE,
         ),
         "[微信ID]",

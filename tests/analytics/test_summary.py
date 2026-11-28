@@ -352,10 +352,17 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(redact_text("电话号是：1234567"), "[电话]")
         self.assertEqual(redact_text("手机号码是：1234567"), "[电话]")
         self.assertEqual(redact_text("微信号：zhangsan123"), "[微信ID]")
+        self.assertEqual(redact_text("vx号：abc123"), "[微信ID]")
+        self.assertEqual(redact_text("weixin号：abc123"), "[微信ID]")
+        self.assertEqual(redact_text("微信ID：abc123"), "[微信ID]")
+        self.assertEqual(redact_text("QQ 号：123456789"), "[QQ]")
+        self.assertEqual(redact_text("电话 号：1234567"), "[电话]")
+        self.assertEqual(redact_text("phone number: 12345678"), "[电话]")
         self.assertEqual(redact_text("mp.weixin.qq.com/s/x"), "[链接]")
         self.assertEqual(redact_text("bit.ly/x"), "[链接]")
         self.assertEqual(redact_text("bit.ly:8080/x?token=secret"), "[链接]")
         self.assertEqual(redact_text("example.com?token=secret"), "[链接]")
+        self.assertEqual(redact_text("example.com#token=secret"), "[链接]")
         self.assertEqual(redact_text("@John Doe", terms=("John Doe",)), "[提及]")
         self.assertEqual(redact_text("同意@张三你好"), "同意[提及]")
         self.assertEqual(redact_text("ghp_12345678"), "[密钥]")
@@ -710,6 +717,7 @@ class SummaryTests(unittest.TestCase):
                 allowed_dates=allowed,
             )
         _assert_numbers("03:04", set(), "test", allowed_dates=allowed)
+        _assert_numbers("03:04+00:00", set(), "test", allowed_dates=allowed)
         offset_allowed = _allowed_dates([{
             "id": "F1",
             "value": "2026-01-02T03:04:05+08:00",
