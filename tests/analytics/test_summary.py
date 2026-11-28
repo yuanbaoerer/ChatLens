@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
-from analytics.models import ForwardChild, LinkMeta, Message
-from analytics.prompts import build_chunk_messages, prompt_versions
+from analytics.models import ForwardChild, LinkMeta, Message, QuoteRef
+from analytics.prompts import build_chunk_messages, prompt_hashes, prompt_versions
+from analytics.prompts import summary as prompt_summary
 from analytics.providers.generation import (
     GenerationProvider,
     GenerationRequest,
@@ -54,6 +56,8 @@ class SummaryTests(unittest.TestCase):
         kind: str = "text",
         sender: str = "u_a",
         link_url: str | None = None,
+        reply_to: QuoteRef | None = None,
+        forward_truncated: bool = False,
     ) -> str:
         self.counter += 1
         message_id = f"msg-{self.counter}"
@@ -67,6 +71,8 @@ class SummaryTests(unittest.TestCase):
             kind=kind,
             text=text,
             link_meta=LinkMeta(url=link_url, title="") if link_url else None,
+            reply_to=reply_to,
+            forward_truncated=forward_truncated,
         ))
         return message_id
 
@@ -143,27 +149,28 @@ class SummaryTests(unittest.TestCase):
         fact_id = next(fact["id"] for fact in facts if fact["label"] == "total_messages")
         provider = MockGenerationProvider([
             {"summary": "First chunk.", "evidence_ids": ["msg-1"]},
-            {"summary": "Second chunk.", "evidence_ids": ["msg-2"]},
+            {"summary": "Last chunk.", "evidence_ids": ["msg-3"]},
             {
                 "objective": "The group contains 3 messages.",
-                "topics": [{"label": "Two chunks", "evidence_ids": ["msg-1", "msg-2"]}],
+                "topics": [{"label": "Two chunks", "evidence_ids": ["msg-1", "msg-3"]}],
                 "claims": [{
                     "text": "There are 3 messages.",
-                    "evidence_ids": ["msg-1"],
+                    "evidence_ids": ["msg-3"],
                     "fact_ids": [fact_id],
                 }],
             },
-            {"roast": "3 messages and a missing third act."},
+            {"roast": "3 messages and a missing middle act."},
         ], usage=TokenUsage(5, 2))
         result = SummaryComposer(
             provider,
             SummaryConfig(max_chunks=2, max_messages_per_chunk=1, overlap_messages=0),
         ).compose(snapshot)
 
+        self.assertEqual(result.coverage["chunks_available"], 3)
         self.assertEqual(result.coverage["chunks_processed"], 2)
         self.assertEqual(result.coverage["provider_calls"], 4)
         self.assertEqual(result.usage, TokenUsage(20, 8))
-        self.assertEqual(result.evidence_ids, ("msg-1", "msg-2"))
+        self.assertEqual(result.evidence_ids, ("msg-1", "msg-3"))
         self.assertEqual(len(result.chunk_summaries), 2)
         self.assertIn("messages_truncated:1", result.diagnostics)
 
@@ -250,7 +257,9 @@ class SummaryTests(unittest.TestCase):
     def test_redaction_happens_before_provider_call(self):
         self.add_text(
             "Email a@example.com phone 13800138000 url https://secret.example/x "
-            "www.secret.example wxid_secret sk-ABCDEFGH12345678 123456789012",
+            "www.secret.example wxid_secret sk-ABCDEFGH12345678 123456789012 "
+            "加我wxid_cjk123 密钥sk-CJKID12345678 看www.cjk.example "
+            "联系人cjk@example.com @alice @张三 Alice",
             link_url="https://secret.example/link",
         )
         snapshot = self.snapshot()
@@ -258,7 +267,10 @@ class SummaryTests(unittest.TestCase):
         recorder = RecordingProvider(MockGenerationProvider(
             self.valid_outputs(facts, evidence_ids=["msg-1"]),
         ))
-        SummaryComposer(recorder).compose(snapshot)
+        SummaryComposer(
+            recorder,
+            SummaryConfig(redact_terms=("Alice",)),
+        ).compose(snapshot)
 
         prompt = recorder.requests[0].messages[1].content
         for secret in (
@@ -269,9 +281,25 @@ class SummaryTests(unittest.TestCase):
             "wxid_secret",
             "sk-ABCDEFGH12345678",
             "123456789012",
+            "wxid_cjk123",
+            "sk-CJKID12345678",
+            "www.cjk.example",
+            "cjk@example.com",
+            "@alice",
+            "@张三",
+            "Alice",
         ):
             self.assertNotIn(secret, prompt)
-        for marker in ("[邮箱]", "[电话]", "[链接]", "[微信ID]", "[密钥]", "[数字ID]"):
+        for marker in (
+            "[邮箱]",
+            "[电话]",
+            "[链接]",
+            "[微信ID]",
+            "[密钥]",
+            "[数字ID]",
+            "[提及]",
+            "[成员]",
+        ):
             self.assertIn(marker, prompt)
 
     def test_analyzer_duplicates_are_deduplicated_for_prompt(self):
@@ -426,12 +454,137 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(model_id, "mock-v1")
         self.assertEqual(provider.calls, 1)
 
+    def test_prompt_hash_covers_user_template(self):
+        before = prompt_hashes()["chunk"]
+        with mock.patch.object(
+            prompt_summary,
+            "CHUNK_USER_SUFFIX",
+            prompt_summary.CHUNK_USER_SUFFIX + " changed",
+        ):
+            self.assertNotEqual(prompt_hashes()["chunk"], before)
+
+    def test_chunk_summary_quotes_numbers_and_cjk_are_rejected(self):
+        self.add_text("A synthetic message.")
+        snapshot = self.snapshot()
+        for summary in (
+            'He said "hello" and 999 messages.',
+            "He said 'hello'.",
+            "转发了十次。",
+        ):
+            with self.subTest(summary=summary):
+                provider = MockGenerationProvider([
+                    {"summary": summary, "evidence_ids": ["msg-1"]},
+                ])
+                with self.assertRaises(SummaryGroundingError):
+                    SummaryComposer(provider).compose(snapshot)
+
+    def test_negative_number_and_single_quoted_fact_are_rejected(self):
+        self.add_text("A synthetic message.")
+        snapshot = self.snapshot()
+        facts = build_facts(snapshot)
+        fact_id = next(fact["id"] for fact in facts if fact["label"] == "total_messages")
+        for objective in (
+            "The group has -1 messages.",
+            "The group says 'hello'.",
+        ):
+            with self.subTest(objective=objective):
+                provider = MockGenerationProvider([
+                    {"summary": "One message.", "evidence_ids": ["msg-1"]},
+                    {
+                        "objective": objective,
+                        "topics": [{"label": "Topic", "evidence_ids": ["msg-1"]}],
+                        "claims": [{
+                            "text": "There is 1 message.",
+                            "evidence_ids": ["msg-1"],
+                            "fact_ids": [fact_id],
+                        }],
+                    },
+                ])
+                with self.assertRaises(SummaryGroundingError):
+                    SummaryComposer(provider).compose(snapshot)
+
+    def test_reduce_evidence_must_be_surfaced_in_chunk_summary(self):
+        self.add_text("First message.")
+        self.add_text("Second message.")
+        snapshot = self.snapshot()
+        facts = build_facts(snapshot)
+        provider = MockGenerationProvider([
+            {"summary": "Only the first message.", "evidence_ids": ["msg-1"]},
+            {
+                "objective": "The group has 2 messages.",
+                "topics": [{"label": "Second", "evidence_ids": ["msg-2"]}],
+                "claims": [{
+                    "text": "There are 2 messages.",
+                    "evidence_ids": ["msg-2"],
+                    "fact_ids": [facts[0]["id"]],
+                }],
+            },
+        ])
+        with self.assertRaises(SummaryGroundingError):
+            SummaryComposer(provider).compose(snapshot)
+
+    def test_reply_context_and_payload_truncation_are_reported(self):
+        first_id = self.add_text("Original context.")
+        self.add_text(
+            "Reply body.",
+            reply_to=QuoteRef(
+                target_message_id=first_id,
+                sender_pseudonym="u_b",
+                kind="text",
+                text_excerpt="Quoted original excerpt that is long.",
+            ),
+        )
+        self.add_text("Long " * 20)
+        self.add_text("Forward with truncation.", forward_truncated=True)
+        snapshot = self.snapshot()
+        facts = build_facts(snapshot)
+        recorder = RecordingProvider(MockGenerationProvider(
+            self.valid_outputs(facts, evidence_ids=["msg-1", "msg-2"]),
+        ))
+        result = SummaryComposer(
+            recorder,
+            SummaryConfig(max_message_chars=20),
+        ).compose(snapshot)
+
+        prompt = recorder.requests[0].messages[1].content
+        self.assertIn('"reply_to"', prompt)
+        self.assertIn('"target_evidence_id": "msg-1"', prompt)
+        self.assertIn('"reply_truncated": true', prompt)
+        self.assertGreaterEqual(result.coverage["messages_payload_truncated"], 2)
+        self.assertEqual(result.coverage["replies_truncated"], 1)
+        self.assertEqual(result.coverage["forward_truncated"], 1)
+        self.assertIn("replies_truncated:1", result.diagnostics)
+        self.assertIn("forward_truncated:1", result.diagnostics)
+
+    def test_fact_cap_prioritizes_analyzer_metrics(self):
+        self.add_text("A synthetic message.")
+        snapshot = self.snapshot()
+        analyzer_outputs = {
+            "text.links.duplicates": {
+                "coverage": {
+                    "text_clusters": 1,
+                    "confirmed_duplicate_occurrences": 1,
+                    **{
+                        f"detail_{index}": {"value": index}
+                        for index in range(100)
+                    },
+                },
+            },
+        }
+        facts = build_facts(snapshot, analyzer_outputs)
+        labels = {fact["label"] for fact in facts}
+        self.assertIn("text.links.duplicates.coverage.text_clusters", labels)
+        self.assertIn("text.links.duplicates.coverage.confirmed_duplicate_occurrences", labels)
+        self.assertIn("facts_truncated", labels)
+
     def test_config_validation(self):
         for kwargs in (
             {"max_chunks": 0},
             {"max_chunk_tokens": 1},
             {"overlap_messages": 200},
             {"temperature": 3},
+            {"redact_terms": "Alice"},
+            {"redact_terms": ("A",)},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(SummaryInputError):

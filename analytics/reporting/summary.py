@@ -21,7 +21,7 @@ from analytics.prompts import (
     prompt_hashes,
     prompt_versions,
 )
-from analytics.privacy import redact_text
+from analytics.privacy import REDACTION_VERSION, redact_text
 from analytics.providers.generation import (
     GenerationProvider,
     GenerationRequest,
@@ -29,8 +29,15 @@ from analytics.providers.generation import (
     estimate_tokens,
 )
 
-_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
-_QUOTE_RE = re.compile(r"[\"“”「」『』]")
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_CJK_NUMBER_RE = re.compile(
+    r"[零〇一二两三四五六七八九十百千万亿]+"
+    r"(?=(?:次|条|个|人|天|年|月|日|周|小时|分钟|秒|张|段|句|页))"
+)
+_QUOTE_RE = re.compile(
+    r"[\"“”「」『』‘’《》〈〉]"
+    r"|(?<![A-Za-z0-9])'[^'\n]{1,200}'(?![A-Za-z0-9])"
+)
 _MAX_FACTS = 80
 
 
@@ -56,6 +63,7 @@ class SummaryConfig:
     max_output_tokens: int = 800
     style_max_output_tokens: int = 500
     temperature: float = 0.2
+    redact_terms: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name, value, minimum, maximum in (
@@ -77,6 +85,20 @@ class SummaryConfig:
             raise SummaryInputError("temperature must be between 0 and 2")
         if self.overlap_messages >= self.max_messages_per_chunk:
             raise SummaryInputError("overlap_messages must be smaller than max_messages_per_chunk")
+        if isinstance(self.redact_terms, str) or not isinstance(self.redact_terms, Sequence):
+            raise SummaryInputError("redact_terms must be a sequence of strings")
+        cleaned_terms: list[str] = []
+        for term in self.redact_terms:
+            if not isinstance(term, str):
+                raise SummaryInputError("redact_terms must contain only strings")
+            stripped = term.strip()
+            if not 2 <= len(stripped) <= 64:
+                raise SummaryInputError("redact_terms entries must be 2..64 characters")
+            if stripped not in cleaned_terms:
+                cleaned_terms.append(stripped)
+        if len(cleaned_terms) > 200:
+            raise SummaryInputError("redact_terms must contain at most 200 entries")
+        object.__setattr__(self, "redact_terms", tuple(cleaned_terms))
 
 
 @dataclass(frozen=True)
@@ -140,13 +162,18 @@ def _add_fact(facts: list[tuple[str, Any]], label: str, value: Any) -> None:
 
 
 def _flatten_facts(prefix: str, value: Any, facts: list[tuple[str, Any]]) -> None:
-    if len(facts) >= _MAX_FACTS:
-        return
     if isinstance(value, Mapping):
         for key in sorted(value, key=str):
             _flatten_facts(f"{prefix}.{key}", value[key], facts)
         return
     _add_fact(facts, prefix, value)
+
+
+def _flatten_scalar_facts(prefix: str, value: Mapping, facts: list[tuple[str, Any]]) -> None:
+    for key in sorted(value, key=str):
+        child = value[key]
+        if not isinstance(child, (Mapping, list, tuple)):
+            _add_fact(facts, f"{prefix}.{key}", child)
 
 
 def build_facts(
@@ -160,12 +187,37 @@ def build_facts(
     range_end = snapshot.time_range.end.isoformat() if snapshot.time_range.end else "open"
     _add_fact(entries, "time_range", f"{range_start}..{range_end}")
     _add_fact(entries, "timezone", snapshot.timezone)
-    _flatten_facts("snapshot_coverage", snapshot.coverage.to_dict(), entries)
+    snapshot_coverage = snapshot.coverage.to_dict()
+    core_coverage = {
+        key: snapshot_coverage[key]
+        for key in ("total_top_level", "forward_child_count", "earliest_at", "latest_at")
+        if key in snapshot_coverage
+    }
+    _flatten_facts("snapshot_coverage", core_coverage, entries)
+
+    analyzers: list[tuple[str, Mapping[str, Any]]] = []
     for analyzer_id in sorted(analyzer_outputs or {}):
         output = analyzer_outputs[analyzer_id]
         coverage = output.get("coverage") if isinstance(output, Mapping) else None
         if isinstance(coverage, Mapping):
-            _flatten_facts(f"{analyzer_id}.coverage", coverage, entries)
+            analyzers.append((analyzer_id, coverage))
+    # Analyzer metrics (including duplicate counts) outrank detailed kind/date
+    # breakdowns so the fact cap cannot silently remove the summary's core facts.
+    for analyzer_id, coverage in analyzers:
+        _flatten_scalar_facts(f"{analyzer_id}.coverage", coverage, entries)
+    for analyzer_id, coverage in analyzers:
+        for key in sorted(coverage, key=str):
+            child = coverage[key]
+            if isinstance(child, Mapping):
+                _flatten_facts(f"{analyzer_id}.coverage.{key}", child, entries)
+    _flatten_facts("snapshot_coverage.by_kind", snapshot_coverage.get("by_kind", {}), entries)
+    _flatten_facts(
+        "snapshot_coverage.media_by_kind",
+        snapshot_coverage.get("media_by_kind", {}),
+        entries,
+    )
+
+    omitted = max(0, len(entries) - _MAX_FACTS)
     facts: list[dict[str, Any]] = []
     for index, (label, value) in enumerate(entries[:_MAX_FACTS], start=1):
         facts.append({
@@ -173,6 +225,13 @@ def build_facts(
             "label": label,
             "value": value,
             "text": f"{label} = {value}",
+        })
+    if omitted:
+        facts.append({
+            "id": f"F{len(facts) + 1}",
+            "label": "facts_truncated",
+            "value": omitted,
+            "text": f"facts_truncated = {omitted}",
         })
     return tuple(facts)
 
@@ -187,6 +246,8 @@ def _allowed_numbers(facts: Sequence[Mapping[str, Any]]) -> set[str]:
 def _assert_numbers(text: str, allowed: set[str], field_name: str) -> None:
     if _QUOTE_RE.search(text):
         raise SummaryGroundingError(f"{field_name} contains a quote; CL-06 does not support quotes")
+    if _CJK_NUMBER_RE.search(text):
+        raise SummaryGroundingError(f"{field_name} contains an unsupported number")
     for token in _NUMBER_RE.findall(text):
         if token not in allowed:
             raise SummaryGroundingError(f"{field_name} contains an unsupported number")
@@ -225,7 +286,8 @@ class SummaryComposer:
         include_style: bool = True,
     ) -> SummaryResult:
         facts = build_facts(snapshot, analyzer_outputs)
-        items = self._collect_items(snapshot)
+        allowed_numbers = _allowed_numbers(facts)
+        items, payload_coverage = self._collect_items(snapshot)
         duplicate_ids = self._duplicate_evidence_ids(analyzer_outputs)
         kept_items = [
             item for item in items
@@ -243,13 +305,14 @@ class SummaryComposer:
                 evidence_ids=(),
                 chunk_summaries=(),
                 coverage={
+                    **payload_coverage,
                     "messages_available": 0,
                     "messages_included": 0,
                     "messages_truncated": 0,
                     "chunks_processed": 0,
                     "chunks_truncated": False,
                     "messages_deduplicated": deduplicated,
-                    "redaction": "regex-v1",
+                    "redaction": REDACTION_VERSION,
                     "analyzer_outputs": sorted(analyzer_outputs or {}),
                     "prompt_versions": prompt_versions(),
                     "provider_calls": 0,
@@ -264,7 +327,8 @@ class SummaryComposer:
         usage = TokenUsage()
         model_ids: list[str] = []
         chunk_summaries: list[dict[str, Any]] = []
-        for chunk in chunks:
+        summarized_evidence: set[str] = set()
+        for index, chunk in enumerate(chunks, start=1):
             if cancellation is not None:
                 cancellation.check()
             response = self.provider.generate(GenerationRequest(
@@ -276,8 +340,10 @@ class SummaryComposer:
             ), cancellation)
             usage = _add_usage(usage, response.usage)
             model_ids.append(response.model_id)
-            allowed_evidence = {item["evidence_id"] for item in chunk}
+            allowed_evidence = self._chunk_evidence_ids(chunk)
             _validate_evidence(response.output.get("evidence_ids"), allowed_evidence, "chunk evidence")
+            _assert_numbers(response.output["summary"], allowed_numbers, f"chunk {index} summary")
+            summarized_evidence.update(response.output["evidence_ids"])
             chunk_summaries.append({
                 "summary": response.output["summary"],
                 "evidence_ids": list(response.output["evidence_ids"]),
@@ -295,12 +361,7 @@ class SummaryComposer:
         usage = _add_usage(usage, fact_response.usage)
         model_ids.append(fact_response.model_id)
         fact_sheet = dict(fact_response.output)
-        allowed_evidence = {
-            evidence_id
-            for chunk in chunks
-            for evidence_id in (item["evidence_id"] for item in chunk)
-        }
-        self._validate_fact_sheet(fact_sheet, allowed_evidence, facts)
+        self._validate_fact_sheet(fact_sheet, summarized_evidence, facts)
 
         roast = ""
         if include_style:
@@ -314,6 +375,20 @@ class SummaryComposer:
             diagnostics.append(f"messages_truncated:{chunk_coverage['messages_truncated']}")
         if chunk_coverage["chunks_truncated"]:
             diagnostics.append("chunks_truncated")
+        if payload_coverage["messages_payload_truncated"]:
+            diagnostics.append(
+                f"messages_payload_truncated:{payload_coverage['messages_payload_truncated']}"
+            )
+        if payload_coverage["forward_truncated"]:
+            diagnostics.append(f"forward_truncated:{payload_coverage['forward_truncated']}")
+        if payload_coverage["replies_truncated"]:
+            diagnostics.append(f"replies_truncated:{payload_coverage['replies_truncated']}")
+        fact_truncated = next(
+            (fact["value"] for fact in facts if fact["label"] == "facts_truncated"),
+            0,
+        )
+        if fact_truncated:
+            diagnostics.append(f"facts_truncated:{fact_truncated}")
         if not include_style:
             diagnostics.append("style_skipped")
         evidence_ids = sorted({
@@ -326,9 +401,10 @@ class SummaryComposer:
             for evidence_id in item.get("evidence_ids", [])
         })
         coverage = {
+            **payload_coverage,
             **chunk_coverage,
             "messages_deduplicated": deduplicated,
-            "redaction": "regex-v1",
+            "redaction": REDACTION_VERSION,
             "analyzer_outputs": sorted(analyzer_outputs or {}),
             "prompt_versions": prompt_versions(),
             "provider_calls": len(chunks) + 1 + (1 if include_style else 0),
@@ -391,8 +467,40 @@ class SummaryComposer:
                             duplicate_ids.add(member)
         return duplicate_ids
 
-    def _collect_items(self, snapshot: Snapshot) -> list[dict[str, Any]]:
+    def _collect_items(
+        self,
+        snapshot: Snapshot,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
         items: list[dict[str, Any]] = []
+        coverage = {
+            "messages_payload_truncated": 0,
+            "forward_truncated": 0,
+            "replies_truncated": 0,
+        }
+
+        def render_text(text: str) -> tuple[str, bool]:
+            rendered = redact_text(
+                text,
+                max_chars=self.config.max_message_chars + 1,
+                terms=self.config.redact_terms,
+            )
+            truncated = len(rendered) > self.config.max_message_chars
+            return rendered[:self.config.max_message_chars], truncated
+
+        def render_reply(reply: Any | None) -> tuple[dict[str, Any] | None, bool]:
+            if reply is None:
+                return None, False
+            text, truncated = render_text(reply.text_excerpt)
+            payload: dict[str, Any] = {
+                "sender": reply.sender_pseudonym,
+                "kind": reply.kind,
+                "text": text,
+            }
+            if reply.target_message_id:
+                payload["target_evidence_id"] = reply.target_message_id
+            if truncated:
+                payload["truncated"] = True
+            return payload, truncated
 
         def add(
             evidence_id: str,
@@ -403,23 +511,41 @@ class SummaryComposer:
             *,
             has_link: bool,
             has_media: bool,
+            reply_to: Any | None = None,
+            forward_truncated: bool = False,
         ) -> None:
-            rendered_text = redact_text(text, max_chars=self.config.max_message_chars)
+            rendered_text, text_truncated = render_text(text)
+            reply_payload, reply_truncated = render_reply(reply_to)
+            if text_truncated or reply_truncated:
+                coverage["messages_payload_truncated"] += 1
+            if reply_truncated:
+                coverage["replies_truncated"] += 1
+            if forward_truncated:
+                coverage["forward_truncated"] += 1
             markers = []
             if has_link:
                 markers.append("[链接]")
             if has_media:
                 markers.append("[媒体]")
             rendered = " ".join(part for part in (rendered_text, *markers) if part)
-            if not rendered:
+            if not rendered and reply_payload is None:
                 return
-            items.append({
+            item: dict[str, Any] = {
                 "evidence_id": evidence_id,
                 "sent_at": sent_at.astimezone(timezone.utc).isoformat(),
                 "sender": sender,
                 "kind": kind,
                 "text": rendered,
-            })
+            }
+            if reply_payload is not None:
+                item["reply_to"] = reply_payload
+            if text_truncated:
+                item["text_truncated"] = True
+            if reply_truncated:
+                item["reply_truncated"] = True
+            if forward_truncated:
+                item["forward_truncated"] = True
+            items.append(item)
 
         def visit_child(child, fallback_sent_at: datetime) -> None:
             sent_at = child.sent_at or fallback_sent_at
@@ -431,6 +557,8 @@ class SummaryComposer:
                 child.kind,
                 has_link=child.link_meta is not None,
                 has_media=bool(child.media_refs),
+                reply_to=child.reply_to,
+                forward_truncated=child.truncated,
             )
             for nested in child.forward_children:
                 visit_child(nested, sent_at)
@@ -441,7 +569,10 @@ class SummaryComposer:
                 and bool(message.forward_children)
                 and message.link_meta is None
                 and not message.media_refs
+                and message.reply_to is None
             )
+            if forward_only_parent and message.forward_truncated:
+                coverage["forward_truncated"] += 1
             if not forward_only_parent:
                 add(
                     message.message_id,
@@ -451,19 +582,34 @@ class SummaryComposer:
                     message.kind,
                     has_link=message.link_meta is not None,
                     has_media=bool(message.media_refs),
+                    reply_to=message.reply_to,
+                    forward_truncated=message.forward_truncated,
                 )
             for child in message.forward_children:
                 visit_child(child, message.sent_at)
-        return items
+        return items, coverage
+
+    @staticmethod
+    def _chunk_evidence_ids(chunk: Sequence[Mapping[str, Any]]) -> set[str]:
+        evidence: set[str] = set()
+        for item in chunk:
+            evidence_id = item.get("evidence_id")
+            if isinstance(evidence_id, str):
+                evidence.add(evidence_id)
+            reply = item.get("reply_to")
+            if isinstance(reply, Mapping):
+                target = reply.get("target_evidence_id")
+                if isinstance(target, str):
+                    evidence.add(target)
+        return evidence
 
     def _chunk_items(
         self,
         items: Sequence[Mapping[str, Any]],
     ) -> tuple[list[list[Mapping[str, Any]]], dict[str, Any]]:
-        chunks: list[list[Mapping[str, Any]]] = []
-        included: set[str] = set()
+        available_chunks: list[list[Mapping[str, Any]]] = []
         start = 0
-        while start < len(items) and len(chunks) < self.config.max_chunks:
+        while start < len(items):
             chunk: list[Mapping[str, Any]] = []
             tokens = 0
             index = start
@@ -478,19 +624,34 @@ class SummaryComposer:
             if not chunk:
                 chunk = [items[start]]
                 index = start + 1
-            chunks.append(chunk)
-            included.update(item["evidence_id"] for item in chunk)
+            available_chunks.append(chunk)
             if index >= len(items):
-                start = index
                 break
             start = max(start + 1, index - self.config.overlap_messages)
-        truncated = start < len(items)
+
+        if len(available_chunks) <= self.config.max_chunks:
+            chunks = available_chunks
+        elif self.config.max_chunks == 1:
+            chunks = [available_chunks[0]]
+        else:
+            # Sample evenly across the full time span instead of always taking
+            # an earliest-message prefix; the first/last chunks stay visible.
+            last = len(available_chunks) - 1
+            indexes = {
+                round(index * last / (self.config.max_chunks - 1))
+                for index in range(self.config.max_chunks)
+            }
+            chunks = [available_chunks[index] for index in sorted(indexes)]
+        included: set[str] = set()
+        for chunk in chunks:
+            included.update(item["evidence_id"] for item in chunk)
         coverage = {
             "messages_available": len(items),
             "messages_included": len(included),
             "messages_truncated": len(items) - len(included),
+            "chunks_available": len(available_chunks),
             "chunks_processed": len(chunks),
-            "chunks_truncated": truncated,
+            "chunks_truncated": len(chunks) < len(available_chunks),
             "max_chunks": self.config.max_chunks,
             "max_chunk_tokens": self.config.max_chunk_tokens,
         }

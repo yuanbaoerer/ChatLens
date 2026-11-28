@@ -4,7 +4,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+from collections.abc import Sequence
 from pathlib import Path, PureWindowsPath
+
+REDACTION_VERSION = "regex-v2"
 
 
 class Pseudonymizer:
@@ -63,30 +66,81 @@ class Pseudonymizer:
         return "Pseudonymizer(<redacted-scope>)"
 
 
+# Boundaries must be ASCII-aware: Python's `\w` and `\b` include CJK, so `\b`
+# would fail to match a URL/ID directly after a Chinese character.
 _REDACTION_PATTERNS = (
     (re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE), "[链接]"),
-    (re.compile(r"\bwww\.[^\s<>\"']+", re.IGNORECASE), "[链接]"),
-    (re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"), "[邮箱]"),
+    (re.compile(r"(?<![A-Za-z0-9])www\.[^\s<>\"']+", re.IGNORECASE), "[链接]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@"
+            r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9.-])"
+        ),
+        "[邮箱]",
+    ),
     (re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"), "[电话]"),
-    (re.compile(r"\bwxid_[A-Za-z0-9_-]+", re.IGNORECASE), "[微信ID]"),
-    (re.compile(r"\b(?:sk|ghp|gho|xox[baprs])-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE), "[密钥]"),
-    (re.compile(r"(?<!\d)\d{10,}(?!\d)"), "[数字ID]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])wxid_[A-Za-z0-9_-]+(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        ),
+        "[微信ID]",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:sk|ghp|gho|xox[baprs])-[A-Za-z0-9_-]{8,}"
+            r"(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        ),
+        "[密钥]",
+    ),
+    (re.compile(r"(?<!\d)(?:\d[ -]?){9,}\d(?!\d)"), "[数字ID]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_.])@[^\s<>\"'@，,。；;：:！!？?]{1,64}"
+        ),
+        "[提及]",
+    ),
 )
 
 
-def redact_text(text: str, *, max_chars: int = 500) -> str:
+def redact_text(
+    text: str,
+    *,
+    max_chars: int = 500,
+    terms: Sequence[str] = (),
+) -> str:
     """Minimize free text before provider calls without normalizing its meaning.
 
-    URLs, emails, phone numbers, WeChat/secret-like identifiers and long digit
-    sequences are replaced. Whitespace is collapsed and the result is bounded;
-    callers must not treat redaction as a substitute for consent or retention
+    URLs, emails, phone numbers, WeChat/secret-like identifiers, @mentions and
+    long digit sequences are replaced. Optional caller-authorized member names
+    are replaced next, before the result is bounded. Whitespace is collapsed.
+    Callers must not treat redaction as a substitute for consent or retention
     controls.
     """
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")
+    if isinstance(terms, str):
+        raise ValueError("terms must be a sequence of strings, not a string")
+    normalized_terms = sorted(
+        {
+            term.strip()
+            for term in terms
+            if isinstance(term, str) and len(term.strip()) >= 2
+        },
+        key=len,
+        reverse=True,
+    )
     value = " ".join(str(text or "").split())
     for pattern, replacement in _REDACTION_PATTERNS:
         value = pattern.sub(replacement, value)
+    if normalized_terms:
+        value = re.sub(
+            "|".join(re.escape(term) for term in normalized_terms),
+            "[成员]",
+            value,
+            flags=re.IGNORECASE,
+        )
     return value[:max_chars]
 
 
