@@ -630,8 +630,14 @@ class SummaryTests(unittest.TestCase):
         _assert_numbers("group’s", set(), "test")
         _assert_numbers("rock 'n' roll", set(), "test")
         _assert_numbers("《红楼梦》", set(), "test")
-        with self.assertRaises(SummaryGroundingError):
-            _assert_numbers("‘hello’", set(), "test")
+        for quoted in (
+            "‘hello’", "’hi’", "‘hello‘", "＇hello＇", "'hello’",
+            "«hello»", "`hello`", "'Alice's plan'", "'don't give up'",
+            "'y'all know'", "＂你好＂", "‹你好›", "〝你好〞", "﹁你好﹂",
+        ):
+            with self.subTest(quoted=quoted):
+                with self.assertRaises(SummaryGroundingError):
+                    _assert_numbers(quoted, set(), "test")
         with self.assertRaises(SummaryGroundingError):
             _assert_numbers("‘I don’t know’", set(), "test")
         with self.assertRaises(SummaryGroundingError):
