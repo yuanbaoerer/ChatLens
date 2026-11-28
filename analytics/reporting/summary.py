@@ -170,6 +170,7 @@ _ARABIC_DATE_MASK_RE = re.compile(
     r"|\d{1,2}:\d{2}(?::\d{2})?"
     r")"
 )
+_DECADE_RE = re.compile(r"(?<!\d)'?\d{2}s\b", re.IGNORECASE)
 _ARABIC_SCALE_RE = re.compile(
     r"-?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)([百千万亿]+)"
 )
@@ -525,6 +526,9 @@ def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
             mentions.append((Decimal(0), True))
     arabic_masked = _ARABIC_DATE_MASK_RE.sub(
         lambda match: " " * len(match.group()), text
+    )
+    arabic_masked = _DECADE_RE.sub(
+        lambda match: " " * len(match.group()), arabic_masked
     )
     for match in _ARABIC_SCALE_RE.finditer(arabic_masked):
         raw = match.group()
@@ -949,6 +953,7 @@ class SummaryComposer:
         analyzer_outputs: Mapping[str, Mapping[str, Any]] | None,
     ) -> set[str]:
         duplicate_ids: set[str] = set()
+        representatives: set[str] = set()
         for output in (analyzer_outputs or {}).values():
             for key in ("clusters", "short_phrase_clusters"):
                 clusters = output.get(key) if isinstance(output, Mapping) else None
@@ -960,13 +965,15 @@ class SummaryComposer:
                     if cluster.get("relation") != "exact_duplicate":
                         continue
                     representative = cluster.get("representative_evidence_id")
+                    if isinstance(representative, str):
+                        representatives.add(representative)
                     members = cluster.get("member_evidence_ids", [])
                     if not isinstance(members, list):
                         continue
                     for member in members:
                         if isinstance(member, str) and member != representative:
                             duplicate_ids.add(member)
-        return duplicate_ids
+        return duplicate_ids - representatives
 
     def _collect_items(
         self,

@@ -348,9 +348,14 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(redact_text("电话（12345678）"), "[电话]")
         self.assertEqual(redact_text("QQ(123456789)"), "[QQ]")
         self.assertEqual(redact_text("QQ号：123456789"), "[QQ]")
+        self.assertEqual(redact_text("QQ号是：123456789"), "[QQ]")
+        self.assertEqual(redact_text("电话号是：1234567"), "[电话]")
+        self.assertEqual(redact_text("手机号码是：1234567"), "[电话]")
+        self.assertEqual(redact_text("微信号：zhangsan123"), "[微信ID]")
         self.assertEqual(redact_text("mp.weixin.qq.com/s/x"), "[链接]")
         self.assertEqual(redact_text("bit.ly/x"), "[链接]")
-        self.assertEqual(redact_text("example.com:8080/reset?token=x"), "[链接]")
+        self.assertEqual(redact_text("bit.ly:8080/x?token=secret"), "[链接]")
+        self.assertEqual(redact_text("example.com?token=secret"), "[链接]")
         self.assertEqual(redact_text("@John Doe", terms=("John Doe",)), "[提及]")
         self.assertEqual(redact_text("同意@张三你好"), "同意[提及]")
         self.assertEqual(redact_text("ghp_12345678"), "[密钥]")
@@ -412,6 +417,36 @@ class SummaryTests(unittest.TestCase):
         )
         result = SummaryComposer(provider).compose(snapshot, analyzer_outputs)
         self.assertEqual(result.coverage["messages_deduplicated"], 0)
+        self.assertEqual(result.coverage["messages_available"], 2)
+
+    def test_multiple_exact_clusters_keep_each_representative(self):
+        self.add_text("One.")
+        self.add_text("Two.")
+        self.add_text("Three.")
+        snapshot = self.snapshot()
+        analyzer_outputs = {
+            "media.duplicates": {
+                "coverage": {"exact_duplicate_occurrences": 3},
+                "clusters": [
+                    {
+                        "relation": "exact_duplicate",
+                        "representative_evidence_id": "msg-2",
+                        "member_evidence_ids": ["msg-2", "msg-3"],
+                    },
+                    {
+                        "relation": "exact_duplicate",
+                        "representative_evidence_id": "msg-1",
+                        "member_evidence_ids": ["msg-1", "msg-2", "msg-3"],
+                    },
+                ],
+            },
+        }
+        facts = build_facts(snapshot, analyzer_outputs)
+        provider = MockGenerationProvider(
+            self.valid_outputs(facts, evidence_ids=["msg-1", "msg-2"]),
+        )
+        result = SummaryComposer(provider).compose(snapshot, analyzer_outputs)
+        self.assertEqual(result.coverage["messages_deduplicated"], 1)
         self.assertEqual(result.coverage["messages_available"], 2)
 
     def test_empty_snapshot_returns_honest_empty_result(self):
