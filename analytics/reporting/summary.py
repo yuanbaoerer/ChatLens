@@ -171,7 +171,8 @@ _ARABIC_DATE_MASK_RE = re.compile(
     r")"
 )
 _DECADE_RE = re.compile(
-    r"(?<!\d)'?\d{2}s(?![A-Za-z0-9])|\b\d{4}s(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])'?\d{2}(?:s|年代)(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])\d{4}(?:s|年代)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _ARABIC_SCALE_RE = re.compile(
@@ -200,7 +201,7 @@ _CJK_NON_NUMERIC_RE = re.compile(
     r"一方面|一下|一会儿|一点|一心|一味|一概|一律|一贯|一连|一并|"
     r"一同|一向|一时|一经|一手|一体|一如|一番|万一|统一|唯一|"
     r"百分之|百分比|千分之|万分之|十分(?!钟)|进一步|第一|三明治|千万不要|"
-    r"千万别|千万不能|一本正经|一声不吭|一步到位|一片混乱|一根筋|一波三折|一部分|一部份"
+    r"千万别|千万不能|一本正经|一声不吭|一步到位|一片混乱|一根筋|一波三折|一部分|一部份|一五一十|千千万万|万万千千"
 )
 
 
@@ -512,6 +513,9 @@ def _cjk_is_contextual(text: str, start: int, end: int) -> bool:
     tail = text[end:]
     if prefix.endswith("第"):
         return False
+    value = text[start:end]
+    if len(value) >= 2 and any(unit in value for unit in _CJK_UNITS):
+        return True
     if tail.startswith(_CJK_MEASURES):
         return True
     if any(prefix.endswith(marker) for marker in _CJK_NUMERIC_PREFIXES):

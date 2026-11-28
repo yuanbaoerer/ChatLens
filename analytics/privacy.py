@@ -113,7 +113,7 @@ _REDACTION_PATTERNS = (
     ),
     (
         re.compile(
-            r"(?:微信号|微信|vx|weixin)\s*(?:号|ID|id)?\s*(?:是|为)?\s*"
+            r"(?:微信号|微信|vx|weixin|wx|v信)\s*(?:号|ID|id)?\s*(?:是|为)?\s*"
             r"[:：]?\s*[A-Za-z][A-Za-z0-9_-]{5,}",
             re.IGNORECASE,
         ),

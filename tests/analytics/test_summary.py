@@ -355,6 +355,8 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(redact_text("vx号：abc123"), "[微信ID]")
         self.assertEqual(redact_text("weixin号：abc123"), "[微信ID]")
         self.assertEqual(redact_text("微信ID：abc123"), "[微信ID]")
+        self.assertEqual(redact_text("加我wx：abc12345"), "加我[微信ID]")
+        self.assertEqual(redact_text("V信：abc12345"), "[微信ID]")
         self.assertEqual(redact_text("QQ 号：123456789"), "[QQ]")
         self.assertEqual(redact_text("电话 号：1234567"), "[电话]")
         self.assertEqual(redact_text("phone number: 12345678"), "[电话]")
@@ -659,6 +661,8 @@ class SummaryTests(unittest.TestCase):
             ("1千万", 10_000_000), ("说了两幅图", 2), ("五封消息", 5),
             ("五波消息", 5), ("四组", 4), ("3百条", 300), ("1百", 100),
             ("五位成员", 5), ("三名成员", 3), ("一部电影", 1),
+            ("这条视频三千万播放", 30_000_000), ("群里三千万消息", 30_000_000),
+            ("群消息三千万", 30_000_000),
         ):
             with self.subTest(exact=exact):
                 self.assertEqual(_number_mentions(exact), [(Decimal(value), False)])
@@ -671,7 +675,7 @@ class SummaryTests(unittest.TestCase):
         for lexical in (
             "进一步", "第一", "三明治", "千万不要", "no one", "一本正经",
             "一声不吭", "一步到位", "一片混乱", "一根筋", "一部分成员",
-            "一部份成员",
+            "一部份成员", "一五一十", "千千万万", "万万千千",
         ):
             with self.subTest(lexical=lexical):
                 self.assertEqual(_number_mentions(lexical), [])
