@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
+from collections.abc import Sequence
 from pathlib import Path, PureWindowsPath
+
+REDACTION_VERSION = "regex-v5"
 
 
 class Pseudonymizer:
@@ -60,6 +64,121 @@ class Pseudonymizer:
 
     def __repr__(self) -> str:
         return "Pseudonymizer(<redacted-scope>)"
+
+
+# Boundaries must be ASCII-aware: Python's `\w` and `\b` include CJK, so `\b`
+# would fail to match a URL/ID directly after a Chinese character.
+_REDACTION_PATTERNS = (
+    (re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE), "[链接]"),
+    (re.compile(r"(?<![A-Za-z0-9])www\.[^\s<>\"']+", re.IGNORECASE), "[链接]"),
+    # ASCII local parts are handled first so Chinese prose before an ASCII
+    # address is preserved. Unicode local parts and IDN domains are fallback.
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[\w-]+(?:\.[\w-]+)+"
+        ),
+        "[邮箱]",
+    ),
+    (re.compile(r"(?<![A-Za-z0-9._%+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[邮箱]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9@])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}"
+            r"(?::\d{1,5})?(?:[/?#][^\s<>\"']*)?"
+        ),
+        "[链接]",
+    ),
+    (
+        re.compile(
+            r"(?:电话|手机|tel|phone)\s*(?:号|号码|number)?\s*"
+            r"(?:是|为)?\s*[:：]?\s*"
+            r"[（(]?\s*\+?\d[\d ()-]{5,18}\d\s*[）)]?(?!\d)",
+            re.IGNORECASE,
+        ),
+        "[电话]",
+    ),
+    (
+        re.compile(
+            r"(?:QQ|qq)\s*(?:号|号码|number)?\s*(?:是|为)?\s*[:：]?\s*"
+            r"[（(]?\s*\d{5,15}\s*[）)]?(?!\d)"
+        ),
+        "[QQ]",
+    ),
+    (re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"), "[电话]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])wxid_[A-Za-z0-9_-]+(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        ),
+        "[微信ID]",
+    ),
+    (
+        re.compile(
+            r"(?:微信号|微信|vx|weixin|wx|v信)\s*(?:号|ID|id)?\s*(?:是|为)?\s*"
+            r"[:：]?\s*[A-Za-z][A-Za-z0-9_-]{5,}",
+            re.IGNORECASE,
+        ),
+        "[微信ID]",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:sk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{8,}"
+            r"(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        ),
+        "[密钥]",
+    ),
+    (re.compile(r"(?<!\d)(?:\d[ -]?){9,}\d(?!\d)"), "[数字ID]"),
+)
+
+# Applied after URL/email/ID patterns and configured name terms. The optional
+# capitalized second token catches common Latin full names such as `@John Doe`.
+_MENTION_PATTERN = re.compile(
+    r"(?:@|＠)(?:"
+    r"[A-Za-z0-9_][A-Za-z0-9_'’.-]{0,63}"
+    r"|[^\s<>\"'@，,。；;：:！!？?]{1,64}"
+    r")(?:[ \t]+[A-Za-z][A-Za-z0-9_'’.-]{0,63}){0,4}"
+)
+
+
+def redact_text(
+    text: str,
+    *,
+    max_chars: int = 500,
+    terms: Sequence[str] = (),
+) -> str:
+    """Minimize free text before provider calls, failing closed at boundaries.
+
+    URLs, emails, phone numbers, WeChat/secret-like identifiers, @mentions and
+    long digit sequences are replaced. Optional caller-authorized member names
+    are replaced next, before the result is bounded. Redaction fails closed and
+    may remove adjacent context when a boundary is ambiguous; callers must not
+    treat it as a substitute for consent or retention controls.
+    """
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
+        raise ValueError("max_chars must be a positive integer")
+    if isinstance(terms, str):
+        raise ValueError("terms must be a sequence of strings, not a string")
+    normalized_terms = sorted(
+        {
+            term.strip()
+            for term in terms
+            if isinstance(term, str) and len(term.strip()) >= 2
+        },
+        key=len,
+        reverse=True,
+    )
+    value = " ".join(str(text or "").split())
+    for pattern, replacement in _REDACTION_PATTERNS:
+        value = pattern.sub(replacement, value)
+    if normalized_terms:
+        value = re.sub(
+            "|".join(re.escape(term) for term in normalized_terms),
+            "[成员]",
+            value,
+            flags=re.IGNORECASE,
+        )
+    value = _MENTION_PATTERN.sub("[提及]", value)
+    return value[:max_chars]
 
 
 def resolve_safe_path(root: Path, relative_path: str, *, base: Path | None = None) -> Path | None:
