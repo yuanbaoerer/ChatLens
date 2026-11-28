@@ -36,7 +36,7 @@ _ARABIC_NUMBER_RE = re.compile(
 )
 _QUOTE_RE = re.compile(
     r"[\"“”「」『』«»‚‛＂‹›〝〞﹁﹂﹃﹄＇]"
-    r"|(?<![A-Za-z0-9])'(?!n['’]|em['’]|til['’]|cause\b|\d)"
+    r"|(?<![A-Za-z0-9])'(?!n['’]|em['’]|til['’]|cause\b|\d{2}[sS]\b)"
     r"(?:[^'\n]|'(?=[A-Za-z])){1,200}['’](?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])‘[^\n]{1,200}['’](?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])’[^\n]{1,200}’(?![A-Za-z0-9])"
@@ -147,7 +147,8 @@ _CJK_MEASURES = (
     "公里", "米", "克", "分", "倍", "成", "种", "类", "项", "级", "折", "层",
     "届", "期", "轮", "场", "遍", "趟", "声", "步", "杯", "本", "只", "件", "台",
     "辆", "家", "所", "间", "幅", "则", "封", "笔", "枚", "座", "支", "根", "颗",
-    "粒", "片", "组", "波", "对", "双", "匹", "朵",
+    "粒", "片", "组", "波", "对", "双", "匹", "朵", "位", "名", "首", "部",
+    "集", "章",
 )
 _CJK_NUMERIC_PREFIXES = (
     "共", "有", "达", "为", "是", "到", "超", "约", "近", "大约", "至少", "最多",
@@ -170,9 +171,9 @@ _ARABIC_DATE_MASK_RE = re.compile(
     r")"
 )
 _ARABIC_SCALE_RE = re.compile(
-    r"-?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)([千万亿]+)"
+    r"-?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)([百千万亿]+)"
 )
-_ARABIC_SCALE_VALUES = {"千": 1_000, "万": 10_000, "亿": 100_000_000}
+_ARABIC_SCALE_VALUES = {"百": 100, "千": 1_000, "万": 10_000, "亿": 100_000_000}
 
 _EN_NON_NUMERIC_RE = re.compile(
     r"\bno one\b|\bone of\b|\bone another\b|\bone's\b",
@@ -195,7 +196,7 @@ _CJK_NON_NUMERIC_RE = re.compile(
     r"一方面|一下|一会儿|一点|一心|一味|一概|一律|一贯|一连|一并|"
     r"一同|一向|一时|一经|一手|一体|一如|一番|万一|统一|唯一|"
     r"百分之|百分比|千分之|万分之|十分(?!钟)|进一步|第一|三明治|千万不要|"
-    r"千万别|千万不能|一本正经|一声不吭|一步到位|一片混乱|一根筋"
+    r"千万别|千万不能|一本正经|一声不吭|一步到位|一片混乱|一根筋|一波三折"
 )
 
 
@@ -601,12 +602,22 @@ def _date_components(token: str) -> tuple[int | None, int | None, int | None] | 
     return None
 
 
-def _time_components(token: str) -> tuple[int, int, int | None] | None:
+def _time_components(token: str) -> tuple[int, int, int | None, int | None] | None:
     match = re.search(r"(?:^|[T ])(\d{1,2}):(\d{2})(?::(\d{2}))?", token)
     if match is None:
         return None
     seconds = int(match.group(3)) if match.group(3) is not None else None
-    return int(match.group(1)), int(match.group(2)), seconds
+    offset_match = re.search(r"(Z|[+-]\d{2}:?\d{2})$", token)
+    offset: int | None = None
+    if offset_match:
+        raw = offset_match.group(1)
+        if raw == "Z":
+            offset = 0
+        else:
+            sign = 1 if raw[0] == "+" else -1
+            digits = raw[1:].replace(":", "")
+            offset = sign * (int(digits[:2]) * 60 + int(digits[2:]))
+    return int(match.group(1)), int(match.group(2)), seconds, offset
 
 
 def _date_matches(generated: str, allowed: str) -> bool:
@@ -623,14 +634,16 @@ def _date_matches(generated: str, allowed: str) -> bool:
         for generated_part, allowed_part in zip(generated_date, allowed_date):
             if generated_part is not None and generated_part != allowed_part:
                 return False
-    elif allowed_time is None:
+    else:
         return False
     if generated_time is not None:
         if allowed_time is None:
             return False
-        for generated_part, allowed_part in zip(generated_time, allowed_time):
+        for generated_part, allowed_part in zip(generated_time[:3], allowed_time[:3]):
             if generated_part is not None and generated_part != allowed_part:
                 return False
+        if generated_time[3] is not None and generated_time[3] != allowed_time[3]:
+            return False
     return True
 
 
