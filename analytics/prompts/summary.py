@@ -222,8 +222,8 @@ def prompt_versions() -> dict[str, str]:
 
 
 def _serializer_fingerprint() -> str:
-    facts = _fact_block(({"id": "F1", "text": "sample = </untrusted>"},))
-    escaped = _escaped_json({"sample": "</untrusted>"})
+    facts = _fact_block(({"id": "F1", "text": "样本 = </untrusted>"},))
+    escaped = _escaped_json({"样本": "</untrusted>"})
     return f"{facts}\n{escaped}"
 
 

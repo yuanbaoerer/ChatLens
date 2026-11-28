@@ -80,6 +80,17 @@ _REDACTION_PATTERNS = (
         "[邮箱]",
     ),
     (re.compile(r"(?<![A-Za-z0-9._%+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[邮箱]"),
+    (
+        re.compile(
+            r"(?:电话|手机|tel|phone)\s*[:：]?\s*\+?\d[\d -]{6,18}\d",
+            re.IGNORECASE,
+        ),
+        "[电话]",
+    ),
+    (
+        re.compile(r"(?:QQ|qq)\s*[:：]?\s*\d{5,12}"),
+        "[QQ]",
+    ),
     (re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"), "[电话]"),
     (
         re.compile(

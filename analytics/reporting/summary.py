@@ -35,10 +35,10 @@ _ARABIC_NUMBER_RE = re.compile(
     r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 )
 _QUOTE_RE = re.compile(
-    r"[\"“”「」『』«»‚‛＂‹›〝〞﹁﹂﹃﹄]"
-    r"|(?<![A-Za-z0-9])'(?!n['’]|em['’]|til['’]|cause['’])"
+    r"[\"“”「」『』«»‚‛＂‹›〝〞﹁﹂﹃﹄＇]"
+    r"|(?<![A-Za-z0-9])'(?!n['’]|em['’]|til['’]|cause\b|\d)"
     r"(?:[^'\n]|'(?=[A-Za-z])){1,200}['’](?![A-Za-z0-9])"
-    r"|(?<![A-Za-z0-9])‘[^'\n]{1,200}’(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])‘[^\n]{1,200}['’](?![A-Za-z0-9])"
     r"|`[^`\n]{1,200}`"
 )
 _MAX_FACTS = 80
@@ -145,7 +145,7 @@ _CJK_MEASURES = (
     "公里", "米", "克", "分", "倍", "成", "种", "类", "项", "级", "折", "层",
     "届", "期", "轮", "场", "遍", "趟", "声", "步", "杯", "本", "只", "件", "台",
     "辆", "家", "所", "间", "幅", "则", "封", "笔", "枚", "座", "支", "根", "颗",
-    "粒", "片",
+    "粒", "片", "组", "波", "对", "双", "匹", "朵",
 )
 _CJK_NUMERIC_PREFIXES = (
     "共", "有", "达", "为", "是", "到", "超", "约", "近", "大约", "至少", "最多",
@@ -181,18 +181,19 @@ _NUMBER_APPROX_PREFIXES = (
     "more than", "less than", "at least", "at most", "fewer than", "up to",
     "no more than", "no less than", "约", "大约", "近", "接近", "超过", "不足",
     "不到", "至少", "最多", "少于", "低于", "多于", "高于", "大概", "差不多",
+    "approx.", "~", "≈", "circa",
 )
 _NUMBER_APPROX_SUFFIXES = (
     "多", "余", "几", "左右", "上下", "以上", "以下", "以内", "出头", "开外",
     "不到", "or so", "plus", "-plus", "ish", "-ish", "something",
-    "-something", "+",
+    "-something", "+", "odd", "-odd",
 )
 _CJK_NON_NUMERIC_RE = re.compile(
     r"一起|一共|一定|一般|一些|一直|一致|一切|一旦|一样|一边|一面|"
     r"一方面|一下|一会儿|一点|一心|一味|一概|一律|一贯|一连|一并|"
     r"一同|一向|一时|一经|一手|一体|一如|一番|万一|统一|唯一|"
     r"百分之|百分比|千分之|万分之|十分(?!钟)|进一步|第一|三明治|千万不要|"
-    r"千万别|千万不能|一本正经|一声不吭|一步到位"
+    r"千万别|千万不能|一本正经|一声不吭|一步到位|一片混乱|一根筋"
 )
 
 
@@ -577,6 +578,60 @@ def _number_mentions(text: str) -> list[tuple[Decimal, bool]]:
     return mentions
 
 
+def _date_components(token: str) -> tuple[int | None, int | None, int | None] | None:
+    iso = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T ].*)?", token)
+    cjk = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})[日号]", token)
+    month_day = re.fullmatch(r"(\d{1,2})月(\d{1,2})[日号]", token)
+    year_month = re.fullmatch(r"(\d{4})年(\d{1,2})月", token)
+    month = re.fullmatch(r"(\d{1,2})月", token)
+    year = re.fullmatch(r"(\d{4})年", token)
+    if iso or cjk:
+        match = iso or cjk
+        return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    if month_day:
+        return (None, int(month_day.group(1)), int(month_day.group(2)))
+    if year_month:
+        return (int(year_month.group(1)), int(year_month.group(2)), None)
+    if month:
+        return (None, int(month.group(1)), None)
+    if year:
+        return (int(year.group(1)), None, None)
+    return None
+
+
+def _time_components(token: str) -> tuple[int, int, int | None] | None:
+    match = re.search(r"(?:^|[T ])(\d{1,2}):(\d{2})(?::(\d{2}))?", token)
+    if match is None:
+        return None
+    seconds = int(match.group(3)) if match.group(3) is not None else None
+    return int(match.group(1)), int(match.group(2)), seconds
+
+
+def _date_matches(generated: str, allowed: str) -> bool:
+    generated_date = _date_components(generated)
+    allowed_date = _date_components(allowed)
+    generated_time = _time_components(generated)
+    allowed_time = _time_components(allowed)
+    if generated_date is None:
+        if generated_time is None:
+            return generated == allowed
+        if allowed_time is None:
+            return False
+    elif allowed_date is not None:
+        for generated_part, allowed_part in zip(generated_date, allowed_date):
+            if generated_part is not None and generated_part != allowed_part:
+                return False
+    elif allowed_time is None:
+        return False
+    if generated_time is not None:
+        if allowed_time is None:
+            return False
+        for generated_part, allowed_part in zip(generated_time, allowed_time):
+            if generated_part is not None and generated_part != allowed_part:
+                return False
+    return True
+
+
 def _date_variants(token: str) -> set[str]:
     variants = {token}
     iso = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T ].*)?", token)
@@ -647,7 +702,10 @@ def _assert_numbers(
     if allowed_dates is not None:
         for pattern in (_ARABIC_DATE_MASK_RE, _CJK_DATE_MASK_RE):
             for match in pattern.finditer(text):
-                if not (_date_variants(match.group()) & allowed_dates):
+                if not any(
+                    _date_matches(match.group(), allowed)
+                    for allowed in allowed_dates
+                ):
                     raise SummaryGroundingError(
                         f"{field_name} contains an ungrounded date or time"
                     )
@@ -724,6 +782,7 @@ class SummaryComposer:
                     "messages_truncated": 0,
                     "chunks_processed": 0,
                     "chunks_truncated": False,
+                    "oversized_chunks": 0,
                     "messages_deduplicated": deduplicated,
                     "redaction": REDACTION_VERSION,
                     "analyzer_outputs": sorted(analyzer_outputs or {}),
@@ -793,6 +852,8 @@ class SummaryComposer:
             diagnostics.append(f"messages_truncated:{chunk_coverage['messages_truncated']}")
         if chunk_coverage["chunks_truncated"]:
             diagnostics.append("chunks_truncated")
+        if chunk_coverage["oversized_chunks"]:
+            diagnostics.append(f"oversized_chunks:{chunk_coverage['oversized_chunks']}")
         if payload_coverage["messages_payload_truncated"]:
             diagnostics.append(
                 f"messages_payload_truncated:{payload_coverage['messages_payload_truncated']}"
@@ -1043,6 +1104,7 @@ class SummaryComposer:
         items: Sequence[Mapping[str, Any]],
     ) -> tuple[list[list[Mapping[str, Any]]], dict[str, Any]]:
         available_chunks: list[list[Mapping[str, Any]]] = []
+        oversized_chunks = 0
         start = 0
         while start < len(items):
             chunk: list[Mapping[str, Any]] = []
@@ -1059,6 +1121,8 @@ class SummaryComposer:
             if not chunk:
                 chunk = [items[start]]
                 index = start + 1
+            if len(chunk) == 1 and tokens > self.config.max_chunk_tokens:
+                oversized_chunks += 1
             available_chunks.append(chunk)
             if index >= len(items):
                 break
@@ -1087,6 +1151,7 @@ class SummaryComposer:
             "chunks_available": len(available_chunks),
             "chunks_processed": len(chunks),
             "chunks_truncated": len(chunks) < len(available_chunks),
+            "oversized_chunks": oversized_chunks,
             "overlap_messages": self.config.overlap_messages,
             "max_chunks": self.config.max_chunks,
             "max_chunk_tokens": self.config.max_chunk_tokens,
