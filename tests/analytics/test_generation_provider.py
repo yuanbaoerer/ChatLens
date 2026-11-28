@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import unittest
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ from analytics.providers.generation import (
     GenerationMessage,
     GenerationNetworkError,
     GenerationRequest,
+    GenerationRequestError,
     GenerationResponseError,
     GenerationSchemaError,
     GenerationTimeout,
@@ -56,6 +58,11 @@ class _Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
             server = self.server
             server.requests.append({"headers": dict(self.headers), "body": json.loads(raw)})
+            if server.redirect_to:
+                self.send_response(302)
+                self.send_header("Location", server.redirect_to)
+                self.end_headers()
+                return
             if server.delay:
                 time.sleep(server.delay)
             status, payload = server.response
@@ -73,12 +80,20 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class GenerationProviderTests(unittest.TestCase):
-    def start_server(self, response, *, status: int = 200, delay: float = 0.0):
+    def start_server(
+        self,
+        response,
+        *,
+        status: int = 200,
+        delay: float = 0.0,
+        redirect_to: str | None = None,
+    ):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         server.daemon_threads = True
         server.requests = []
         server.response = (status, response)
         server.delay = delay
+        server.redirect_to = redirect_to
         server.block_on_close = False
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -182,10 +197,27 @@ class GenerationProviderTests(unittest.TestCase):
         with self.assertRaises(GenerationBudgetExceeded):
             budget.record(TokenUsage(2, 0))
 
-    def test_token_estimation_is_bounded(self):
+    def test_budget_reservations_prevent_concurrent_overspend(self):
+        budget = GenerationBudget(max_total_tokens=150)
+        first = budget.begin_call(100, 50)
+        with self.assertRaises(GenerationBudgetExceeded):
+            budget.begin_call(100, 50)
+        budget.release(first)
+        second = budget.begin_call(100, 50)
+        budget.record(TokenUsage(100, 50), reservation=second)
+        self.assertEqual(budget.snapshot()["total_tokens"], 150)
+
+    def test_output_limit_is_required_for_output_budget(self):
+        budget = GenerationBudget(max_total_tokens=100)
+        provider = MockGenerationProvider([VALID_OUTPUT], budget=budget)
+        with self.assertRaises(GenerationBudgetExceeded):
+            provider.generate(self.request(max_output_tokens=None))
+
+    def test_token_estimation_is_conservative_for_cjk(self):
         self.assertEqual(estimate_tokens(""), 1)
-        self.assertEqual(estimate_tokens("abcd"), 1)
-        self.assertEqual(estimate_tokens("abcde"), 2)
+        self.assertEqual(estimate_tokens("abcd"), 4)
+        self.assertEqual(estimate_tokens("abcde"), 5)
+        self.assertEqual(estimate_tokens("中文测试"), 12)
         self.assertGreater(self.request().estimated_input_tokens(), 0)
 
     def test_real_provider_requires_explicit_opt_in_and_does_not_call(self):
@@ -232,6 +264,52 @@ class GenerationProviderTests(unittest.TestCase):
         self.assertIn("usage_estimated", response.diagnostics)
         self.assertGreater(response.usage.total_tokens, 0)
         self.assertGreater(budget.snapshot()["total_tokens"], 0)
+
+    def test_partial_usage_estimates_the_missing_side(self):
+        payload = self.success_payload()
+        payload["usage"] = {"prompt_tokens": 10}
+        server, endpoint = self.start_server(payload)
+        provider = self.provider(endpoint, enabled=True)
+        response = provider.generate(self.request())
+        self.assertEqual(response.usage.input_tokens, 10)
+        self.assertGreater(response.usage.output_tokens, 0)
+        self.assertIn("usage_estimated", response.diagnostics)
+
+    def test_redirects_are_refused_before_forwarding_credentials(self):
+        target, target_endpoint = self.start_server(self.success_payload())
+        redirect, redirect_endpoint = self.start_server(
+            self.success_payload(),
+            redirect_to=target_endpoint,
+        )
+        provider = self.provider(redirect_endpoint, enabled=True, api_key="synthetic-secret")
+        with self.assertRaises(GenerationHTTPError) as caught:
+            provider.generate(self.request())
+        self.assertEqual(caught.exception.status, 302)
+        self.assertEqual(target.requests, [])
+        self.assertEqual(len(redirect.requests), 1)
+
+    def test_request_size_is_bounded_before_network(self):
+        server, endpoint = self.start_server(self.success_payload())
+        provider = self.provider(endpoint, enabled=True, max_request_bytes=20)
+        with self.assertRaises(GenerationRequestError):
+            provider.generate(self.request())
+        self.assertEqual(server.requests, [])
+
+    def test_http_truncation_is_mapped_to_response_error(self):
+        class BrokenResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                raise IncompleteRead(b"partial", 20)
+
+        provider = self.provider("http://127.0.0.1:1/v1/chat/completions", enabled=True)
+        with patch.object(provider._opener, "open", return_value=BrokenResponse()):
+            with self.assertRaises(GenerationResponseError):
+                provider.generate(self.request())
 
     def test_api_key_can_come_from_environment(self):
         server, endpoint = self.start_server(self.success_payload())
@@ -321,6 +399,8 @@ class GenerationProviderTests(unittest.TestCase):
             {"endpoint": "https://example.com/x", "model": ""},
             {"endpoint": "https://example.com/x", "model": "m", "timeout": 0},
             {"endpoint": "https://example.com/x", "model": "m", "max_concurrency": 0},
+            {"endpoint": "https://example.com/x", "model": "m", "max_request_bytes": 0},
+            {"endpoint": "https://example.com/x", "model": "m", "max_response_bytes": 0},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(GenerationConfigurationError):

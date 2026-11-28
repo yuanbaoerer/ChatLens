@@ -6,6 +6,7 @@ provider is disabled unless ``enabled=True`` is supplied by the caller.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
@@ -24,6 +25,7 @@ from analytics.providers.schema import SchemaValidationError, validate_json_sche
 
 DEFAULT_API_KEY_ENV = "CHATLENS_GENERATION_API_KEY"
 DEFAULT_MAX_RESPONSE_BYTES = 4_000_000
+DEFAULT_MAX_REQUEST_BYTES = 1_000_000
 
 
 class GenerationError(RuntimeError):
@@ -66,9 +68,24 @@ class GenerationResponseError(GenerationError):
     """Raised when the provider response envelope is malformed."""
 
 
+class GenerationRequestError(GenerationError):
+    """Raised when an outgoing generation request exceeds provider limits."""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so bearer credentials cannot be forwarded to a new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
 def estimate_tokens(text: str) -> int:
-    """Conservative dependency-free token estimate for preflight budgeting."""
-    return max(1, math.ceil(len(str(text or "")) / 4))
+    """Conservative dependency-free token estimate for preflight budgeting.
+
+    The UTF-8 byte length is a safe upper bound for byte-level BPE tokenizers
+    and avoids the several-fold underestimation of CJK text by ``len/4``.
+    """
+    return max(1, len(str(text or "").encode("utf-8")))
 
 
 @dataclass(frozen=True)
@@ -173,6 +190,14 @@ class GenerationResponse:
         }
 
 
+@dataclass
+class _BudgetReservation:
+    budget: "GenerationBudget"
+    input_tokens: int
+    output_tokens: int
+    released: bool = False
+
+
 class GenerationBudget:
     """Thread-safe call/token budget shared by provider calls in one run."""
 
@@ -200,8 +225,19 @@ class GenerationBudget:
         self._calls = 0
         self._input_tokens = 0
         self._output_tokens = 0
+        self._reserved_input_tokens = 0
+        self._reserved_output_tokens = 0
 
-    def begin_call(self, estimated_input_tokens: int, requested_output_tokens: int = 0) -> None:
+    @property
+    def requires_output_limit(self) -> bool:
+        """Whether a provider must supply max_output_tokens for preflight safety."""
+        return self.max_output_tokens is not None or self.max_total_tokens is not None
+
+    def begin_call(
+        self,
+        estimated_input_tokens: int,
+        requested_output_tokens: int = 0,
+    ) -> _BudgetReservation:
         if (
             isinstance(estimated_input_tokens, bool)
             or not isinstance(estimated_input_tokens, int)
@@ -219,25 +255,65 @@ class GenerationBudget:
                 raise GenerationBudgetExceeded("generation call budget exceeded")
             if (
                 self.max_input_tokens is not None
-                and self._input_tokens + estimated_input_tokens > self.max_input_tokens
+                and self._input_tokens
+                + self._reserved_input_tokens
+                + estimated_input_tokens
+                > self.max_input_tokens
             ):
                 raise GenerationBudgetExceeded("generation input token budget exceeded")
             if (
                 self.max_output_tokens is not None
-                and self._output_tokens + requested_output_tokens > self.max_output_tokens
+                and self._output_tokens
+                + self._reserved_output_tokens
+                + requested_output_tokens
+                > self.max_output_tokens
             ):
                 raise GenerationBudgetExceeded("generation output token budget exceeded")
             if self.max_total_tokens is not None and (
-                self._input_tokens + self._output_tokens + estimated_input_tokens + requested_output_tokens
+                self._input_tokens
+                + self._output_tokens
+                + self._reserved_input_tokens
+                + self._reserved_output_tokens
+                + estimated_input_tokens
+                + requested_output_tokens
                 > self.max_total_tokens
             ):
                 raise GenerationBudgetExceeded("generation total token budget exceeded")
             self._calls += 1
+            self._reserved_input_tokens += estimated_input_tokens
+            self._reserved_output_tokens += requested_output_tokens
+            return _BudgetReservation(self, estimated_input_tokens, requested_output_tokens)
 
-    def record(self, usage: TokenUsage) -> None:
+    def _consume(self, reservation: _BudgetReservation) -> None:
+        if not isinstance(reservation, _BudgetReservation) or reservation.budget is not self:
+            raise ValueError("reservation belongs to a different budget")
+        if reservation.released:
+            raise ValueError("reservation is already released")
+        self._reserved_input_tokens -= reservation.input_tokens
+        self._reserved_output_tokens -= reservation.output_tokens
+        reservation.released = True
+
+    def release(self, reservation: _BudgetReservation) -> None:
+        with self._lock:
+            if not isinstance(reservation, _BudgetReservation) or reservation.budget is not self:
+                raise ValueError("reservation belongs to a different budget")
+            if reservation.released:
+                return
+            self._reserved_input_tokens -= reservation.input_tokens
+            self._reserved_output_tokens -= reservation.output_tokens
+            reservation.released = True
+
+    def record(
+        self,
+        usage: TokenUsage,
+        *,
+        reservation: _BudgetReservation | None = None,
+    ) -> None:
         if not isinstance(usage, TokenUsage):
             raise TypeError("usage must be TokenUsage")
         with self._lock:
+            if reservation is not None:
+                self._consume(reservation)
             self._input_tokens += usage.input_tokens
             self._output_tokens += usage.output_tokens
             if self.max_input_tokens is not None and self._input_tokens > self.max_input_tokens:
@@ -254,6 +330,8 @@ class GenerationBudget:
                 "input_tokens": self._input_tokens,
                 "output_tokens": self._output_tokens,
                 "total_tokens": self._input_tokens + self._output_tokens,
+                "reserved_input_tokens": self._reserved_input_tokens,
+                "reserved_output_tokens": self._reserved_output_tokens,
             }
 
 
@@ -332,33 +410,47 @@ class MockGenerationProvider:
     ) -> GenerationResponse:
         if cancellation is not None:
             cancellation.check()
-        if self.budget is not None:
-            self.budget.begin_call(
-                request.estimated_input_tokens(),
-                request.max_output_tokens or 0,
+        if (
+            self.budget is not None
+            and self.budget.requires_output_limit
+            and request.max_output_tokens is None
+        ):
+            raise GenerationBudgetExceeded(
+                "max_output_tokens is required when an output or total token budget is set"
             )
-        with self._lock:
-            self._calls += 1
-            if self._responder is not None:
-                output = self._responder(request)
-            elif self._index < len(self._outputs):
-                output = self._outputs[self._index]
-                self._index += 1
-            else:
-                raise GenerationError("mock generation outputs were exhausted")
-        if cancellation is not None:
-            cancellation.check()
-        mapping = _validate_output(output, request.response_schema)
-        if self.budget is not None:
-            self.budget.record(self._usage)
-        return GenerationResponse(
-            output=mapping,
-            provider_id=self.provider_id,
-            model_id=self.model_id,
-            usage=self._usage,
-            finish_reason="stop",
-            diagnostics=("mock",),
-        )
+        reservation = None
+        try:
+            if self.budget is not None:
+                reservation = self.budget.begin_call(
+                    request.estimated_input_tokens(),
+                    request.max_output_tokens or 0,
+                )
+            with self._lock:
+                self._calls += 1
+                if self._responder is not None:
+                    output = self._responder(request)
+                elif self._index < len(self._outputs):
+                    output = self._outputs[self._index]
+                    self._index += 1
+                else:
+                    raise GenerationError("mock generation outputs were exhausted")
+            if cancellation is not None:
+                cancellation.check()
+            mapping = _validate_output(output, request.response_schema)
+            if self.budget is not None:
+                self.budget.record(self._usage, reservation=reservation)
+            return GenerationResponse(
+                output=mapping,
+                provider_id=self.provider_id,
+                model_id=self.model_id,
+                usage=self._usage,
+                finish_reason="stop",
+                diagnostics=("mock",),
+            )
+        except BaseException:
+            if self.budget is not None and reservation is not None:
+                self.budget.release(reservation)
+            raise
 
 
 class OpenAICompatibleGenerationProvider:
@@ -379,6 +471,7 @@ class OpenAICompatibleGenerationProvider:
         max_concurrency: int = 4,
         budget: GenerationBudget | None = None,
         json_mode: bool = True,
+        max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         user_agent: str = "ChatLens/analytics",
     ) -> None:
@@ -411,6 +504,8 @@ class OpenAICompatibleGenerationProvider:
             raise GenerationConfigurationError("timeout must be a positive finite number")
         if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
             raise GenerationConfigurationError("max_concurrency must be a positive integer")
+        if isinstance(max_request_bytes, bool) or not isinstance(max_request_bytes, int) or max_request_bytes < 1:
+            raise GenerationConfigurationError("max_request_bytes must be a positive integer")
         if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int) or max_response_bytes < 1:
             raise GenerationConfigurationError("max_response_bytes must be a positive integer")
         if not isinstance(api_key_env, str) or not api_key_env.strip():
@@ -431,9 +526,11 @@ class OpenAICompatibleGenerationProvider:
         self._timeout = float(timeout)
         self._budget = budget
         self._json_mode = bool(json_mode)
+        self._max_request_bytes = max_request_bytes
         self._max_response_bytes = max_response_bytes
         self._user_agent = user_agent.strip()
         self._semaphore = threading.BoundedSemaphore(max_concurrency)
+        self._opener = urllib.request.build_opener(_NoRedirectHandler())
 
     @property
     def enabled(self) -> bool:
@@ -462,7 +559,16 @@ class OpenAICompatibleGenerationProvider:
             payload["response_format"] = {"type": "json_object"}
         return payload
 
-    def _post(self, payload: Mapping[str, Any]) -> bytes:
+    def _encode_payload(self, payload: Mapping[str, Any]) -> bytes:
+        try:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise GenerationRequestError("generation request is not JSON serializable") from error
+        if len(body) > self._max_request_bytes:
+            raise GenerationRequestError("generation request exceeded the size limit")
+        return body
+
+    def _post(self, body: bytes) -> bytes:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -473,12 +579,12 @@ class OpenAICompatibleGenerationProvider:
             headers["Authorization"] = f"Bearer {api_key}"
         request = urllib.request.Request(
             self._endpoint,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=body,
             headers=headers,
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with self._opener.open(request, timeout=self._timeout) as response:
                 raw = response.read(self._max_response_bytes + 1)
         except urllib.error.HTTPError as error:
             raise GenerationHTTPError(error.code) from error
@@ -488,6 +594,8 @@ class OpenAICompatibleGenerationProvider:
             raise GenerationNetworkError("generation endpoint is unavailable") from error
         except (TimeoutError, socket.timeout) as error:
             raise GenerationTimeout("generation request timed out") from error
+        except http.client.HTTPException as error:
+            raise GenerationResponseError("generation response was truncated") from error
         except OSError as error:
             raise GenerationNetworkError("generation endpoint is unavailable") from error
         if len(raw) > self._max_response_bytes:
@@ -517,15 +625,23 @@ class OpenAICompatibleGenerationProvider:
         usage_estimated = False
         input_tokens = 0
         output_tokens = 0
-        if isinstance(usage, Mapping) and ("prompt_tokens" in usage or "completion_tokens" in usage):
-            for key, target in (("prompt_tokens", "input"), ("completion_tokens", "output")):
-                value = usage.get(key, 0)
+        if isinstance(usage, Mapping):
+            if "prompt_tokens" in usage:
+                value = usage["prompt_tokens"]
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise GenerationResponseError("generation response has invalid usage")
-                if target == "input":
-                    input_tokens = value
-                else:
-                    output_tokens = value
+                input_tokens = value
+            else:
+                input_tokens = request.estimated_input_tokens()
+                usage_estimated = True
+            if "completion_tokens" in usage:
+                value = usage["completion_tokens"]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise GenerationResponseError("generation response has invalid usage")
+                output_tokens = value
+            else:
+                output_tokens = estimate_tokens(content)
+                usage_estimated = True
         else:
             # Local OpenAI-compatible servers may omit usage. Account with a
             # conservative estimate rather than silently bypassing token budgets.
@@ -559,31 +675,46 @@ class OpenAICompatibleGenerationProvider:
             raise ProviderDisabled("generation provider is disabled; explicit opt-in is required")
         if cancellation is not None:
             cancellation.check()
+        if (
+            self._budget is not None
+            and self._budget.requires_output_limit
+            and request.max_output_tokens is None
+        ):
+            raise GenerationBudgetExceeded(
+                "max_output_tokens is required when an output or total token budget is set"
+            )
+        body = self._encode_payload(self._payload(request))
+        reservation = None
         if self._budget is not None:
-            self._budget.begin_call(
+            reservation = self._budget.begin_call(
                 request.estimated_input_tokens(),
                 request.max_output_tokens or 0,
             )
-        with self._semaphore:
-            if cancellation is not None:
-                cancellation.check()
-            raw = self._post(self._payload(request))
-            content, usage, usage_estimated, finish_reason, model_id = self._parse_envelope(raw, request)
-            if self._budget is not None:
-                self._budget.record(usage)
-            if cancellation is not None:
-                cancellation.check()
-            output = _validate_output(self._parse_content(content), request.response_schema)
-            diagnostics = []
-            if self._json_mode and request.response_schema:
-                diagnostics.append("json_mode")
-            if usage_estimated:
-                diagnostics.append("usage_estimated")
-            return GenerationResponse(
-                output=output,
-                provider_id=self.provider_id,
-                model_id=model_id,
-                usage=usage,
-                finish_reason=finish_reason,
-                diagnostics=tuple(diagnostics),
-            )
+        try:
+            with self._semaphore:
+                if cancellation is not None:
+                    cancellation.check()
+                raw = self._post(body)
+                content, usage, usage_estimated, finish_reason, model_id = self._parse_envelope(raw, request)
+                if self._budget is not None:
+                    self._budget.record(usage, reservation=reservation)
+                if cancellation is not None:
+                    cancellation.check()
+                output = _validate_output(self._parse_content(content), request.response_schema)
+                diagnostics = []
+                if self._json_mode and request.response_schema:
+                    diagnostics.append("json_mode")
+                if usage_estimated:
+                    diagnostics.append("usage_estimated")
+                return GenerationResponse(
+                    output=output,
+                    provider_id=self.provider_id,
+                    model_id=model_id,
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    diagnostics=tuple(diagnostics),
+                )
+        except BaseException:
+            if self._budget is not None and reservation is not None:
+                self._budget.release(reservation)
+            raise
