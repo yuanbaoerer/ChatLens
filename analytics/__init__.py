@@ -61,6 +61,14 @@ from analytics.providers import (
     OpenAICompatibleGenerationProvider,
     TokenUsage,
 )
+from analytics.reporting import (
+    SummaryComposer,
+    SummaryConfig,
+    SummaryGroundingError,
+    SummaryInputError,
+    SummaryResult,
+    build_facts,
+)
 from analytics.snapshot import SnapshotBuilder, make_stable_message_id
 
 __all__ = [
@@ -115,10 +123,16 @@ __all__ = [
     "StageRecord",
     "StageSpec",
     "StageStatus",
+    "SummaryComposer",
+    "SummaryConfig",
+    "SummaryGroundingError",
+    "SummaryInputError",
+    "SummaryResult",
     "TextLinkDuplicateAnalyzer",
     "TimeRange",
     "TokenUsage",
     "TypeCoverage",
+    "build_facts",
     "default_registry",
     "make_stable_message_id",
     "resolve_safe_path",
